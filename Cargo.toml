@@ -1,0 +1,18 @@
+[package]
+name = "minipack"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+static_assertions = "1.1.*"
+seahash = "4.1"
+memmap = "0.7.*"
+minifiletree = { path = "../minifiletree" }
+minifilepath = { path = "../minifilepath" }
+minilz4 = { path = "../minilz4" }
+miniclosure = { path = "../miniclosure" }
+
+[dev-dependencies]
+minifilepath_macro = { path = "../minifilepath_macro" }

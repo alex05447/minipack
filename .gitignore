@@ -1,0 +1,6 @@
+.hgignore
+.hg/
+.vscode/
+target/
+Cargo.lock
+packed/
