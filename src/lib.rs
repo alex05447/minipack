@@ -1,4 +1,6 @@
-//! A small library to create, access and patch resource/data file packs/archives.
+//! # minipack
+//!
+//! A small utility library to create, access and patch resource/data file packs/archives.
 //!
 //! A "pack" is a folder which contains some arbitrary resource files used by the application.
 //!
