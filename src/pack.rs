@@ -14,7 +14,15 @@ use {
     },
 };
 
-/// Argument passed to the [`ProgressCallbacks::on_source_files_gathered`] callback.
+/// Called once for each source file to determine whether it should be compressed.
+///
+/// The callback is passed the file's relative path in `src_dir` and its data.
+/// If the callback returns `true`, the file data will be compressed (except if the compressed data is (slightly) larger in size than uncompressed,
+/// which is possible due to compression format overhead when the data is incompressible).
+/// If the callback returns `false`, source file data is not compressed.
+pub type CompressionCallback = dyn FnMut(&FilePath, &[u8]) -> bool;
+
+/// Argument passed to [`OnSourceFilesGatheredCallback`].
 pub struct OnSourceFilesGathered {
     /// Total number of (non-empty) files found in the source directory.
     pub num_files: usize,
@@ -22,84 +30,293 @@ pub struct OnSourceFilesGathered {
     pub total_file_size: u64,
 }
 
-/// Argument passed to the [`ProgressCallbacks::on_source_file_processed`] callback.
+/// Callback called once after the source directory was scanned and all (non-empty) source files gathered.
+///
+/// Returns `true` if processing should continue, or `false` if it should be cancelled
+/// (e.g. to enforce a limit on total source directory size to process to prevent patological cases / accidents).
+///
+/// [`PackError::Cancelled`] is returned if this callback returns `false`.
+pub type OnSourceFilesGatheredCallback<'a> = dyn FnOnce(OnSourceFilesGathered) -> bool + 'a;
+
+/// Argument passed to [`OnSourceFileProcessedCallback`].
 pub struct OnSourceFileProcessed {
-    /// Original size in bytes of the processed file's data.
+    /// Original size in bytes of the processed source file's data.
     /// These add up to [`OnSourceFilesGathered::total_file_size`].
     pub src_file_size: u64,
     /// Equal to `src_file_size` if the source file was not compressed;
-    /// strictly less than `src_file_size` if the source file was compressed;
+    /// strictly less than `src_file_size` if the source file was compressed.
     pub packed_file_size: u64,
+    /// Current total number of created data pack files.
+    pub num_packs: PackIndex,
 }
 
-/// User-provided progress-tracking callbacks passed to [`pack()`].
-pub struct ProgressCallbacks<PCb1, PCb2> {
-    /// Called once after the source directory was processed and all (non-empty) source data files gathered.
-    /// Is passed [`OnSourceFilesGathered`].
-    /// Returns `true` if processing should continue, or `false` if it should be cancelled.
-    pub on_source_files_gathered: PCb1,
-    /// Called after `on_source_files_gathered`, once for each processed source data file
-    /// (so [`OnSourceFilesGathered::num_files`] times total, unless an error occurs).
-    /// Is passed [`OnSourceFileProcessed`].
-    pub on_source_file_processed: PCb2,
+/// Called once for each processed source file
+/// (so [`OnSourceFilesGathered::num_files`] times total, unless an error occurs).
+pub type OnSourceFileProcessedCallback<'a> = dyn FnMut(OnSourceFileProcessed) + 'a;
+
+/// Argument passed to [`BeforePackingCallback`].
+pub struct BeforePacking {
+    /// The number of worker threads which will be used for packing.
+    pub num_workers: usize,
 }
 
-/// Creates a pack in `dst_dir` from the contents of the `src_dir`.
-///
-/// Iterates recursively over all (non-empty) files in `src_dir`.
-///
-/// Splits the file data into "data pack" files no larger then `max_pack_len` bytes
-/// (unless an individual resource file is larger than this value, in which case the "data pack" file
-/// will be as large as the resource file (and only contain this resource file)).
-///
-/// `filepath_hasher` is used to create [`PathHash`]'es from the resource file relative paths whithin `src_dir`
-/// to create the lookup data structure.
-/// This same hasher must then be used when looking up the resource file data in the created pack.
-///
-/// `checksum_hasher` is used to calculate resource file checksums and the pack's checksum / "version", returned by this function.
-/// This same hasher must then be used when opening the pack for reading.
-///
-/// `compression_callback` is called for each processed resource file to determine whether it must be compressed.
-/// The callback is passed the file's relative path in `src_dir` and its data.
-/// If the callback returns `true`, the file data will be compressed (except if the compressed data is (slightly) larger in size than uncompressed,
-/// which is possible due to compression format overhead when the data is incompressible).
-/// If the callback returns `false`, source file data is not compressed.
-///
-/// If `write_file_tree` is `true`, data necessary to unpack the file pack is serialized along with it.
-///
-/// `num_workers` determines the number of worker threads which will be spawned to compress source file data, if necessary.
-/// If `None`, the number of threads is determined by `std::thread::available_parallelism()` (minus 1 for the current thread, which is also used for compression).
-/// If `Some(0)`, no worker threads are spawned, all processing is done on the current thread.
-/// Otherwise one or more worker threads are used.
-///
-/// If `memory_limit` is `Some`, this value will determine the attempted best-effort limit
-/// on the amount of temporary memory allocated at any given time for source file compression purposes.
-/// NOTE: the limit will be exceeded if the required amount of memory to compress a single source file exceeds it in the first place.
-/// NOTE: this value, if too low, also potentially limits compression parallellism, as worker threads cannot
-/// proceed with compression while waiting for temporary memory to become available.
-/// As a rule of thumb, `memory_limit` should be approximately equal to `num_threads * average_file_size`,
-/// where `average_file_size` is the average/representative source file size.
-///
-/// `progress_callbacks` struct contains the callbacks called to track packing progress.
-pub fn pack<F, H, CCb, PCb1, PCb2>(
-    mut src_dir: PathBuf,
-    mut dst_dir: PathBuf,
-    max_pack_len: u64,
+/// Called once immediately before beginning packing / compressing of all gathered source data files.
+pub type BeforePackingCallback<'a> = dyn FnOnce(BeforePacking) + 'a;
+
+/// Argument passed to [`BeforeCompactionCallback`].
+pub struct BeforeCompaction {
+    /// Current total number of created data pack files before their compaction.
+    pub num_packs: PackIndex,
+}
+
+/// If using at least one worker thread and a data pack file limit,
+/// is called once after all gathered source data files were packed / compressed,
+/// before compacting the created data pack files.
+pub type BeforeCompactionCallback<'a> = dyn FnOnce(BeforeCompaction) + 'a;
+
+/// Argument passed to [`OnPackCompactedCallback`].
+pub struct OnPackCompacted {
+    /// Index of the compacted pack, in range `[0 .. BeforeCompaction::num_packs]`.
+    pub pack_index: PackIndex,
+    /// Current total number of created data pack files before their compaction.
+    pub num_packs: PackIndex,
+}
+
+/// If using at least one worker thread and a data pack file limit,
+/// and if there's more than one data pack file,
+/// is called once after each data pack file was compacted
+/// (so [`BeforeCompaction::num_packs`], or [`OnPackCompacted::num_packs`] times total, unless an error occurs).
+pub type OnPackCompactedCallback<'a> = dyn FnMut(OnPackCompacted) + 'a;
+
+/// Argument passed to [`AfterCompactionCallback`].
+pub struct AfterCompaction {
+    /// Total number of created data pack files before their compaction (equal to [`BeforeCompaction::num_packs`]).
+    pub num_packs_before_compaction: PackIndex,
+    /// Current total number of created data pack files after their compaction.
+    pub num_packs: PackIndex,
+}
+
+/// If using at least one worker thread and a data pack file limit,
+/// and if there's more than one data pack file,
+/// is called after all data pack files were compacted.
+pub type AfterCompactionCallback<'a> = dyn FnOnce(AfterCompaction) + 'a;
+
+#[derive(Default)]
+struct ProgressCallbacks<'a> {
+    on_source_files_gathered: Option<Box<OnSourceFilesGatheredCallback<'a>>>,
+    before_packing: Option<Box<BeforePackingCallback<'a>>>,
+    on_source_file_processed: Option<Box<OnSourceFileProcessedCallback<'a>>>,
+    before_compaction: Option<Box<BeforeCompactionCallback<'a>>>,
+    on_pack_compacted: Option<Box<OnPackCompactedCallback<'a>>>,
+    after_compaction: Option<Box<AfterCompactionCallback<'a>>>,
+}
+
+/// Used to configure the packing options and perform packing (see [`PackOptions::pack`]).
+pub struct PackOptions<'a, F, H>
+where
+    F: BuildHasher,
+    F::Hasher: Clone,
+    H: BuildHasher,
+{
+    src_dir: PathBuf,
+    dst_dir: PathBuf,
     filepath_hasher: F,
     checksum_hasher: H,
-    compression_callback: CCb,
-    write_file_tree: bool,
+    max_pack_size: Option<u64>,
+    compression_callback: Option<Box<CompressionCallback>>,
     num_workers: Option<usize>,
     memory_limit: Option<u64>,
-    progress_callbacks: ProgressCallbacks<PCb1, PCb2>,
+    write_file_tree: bool,
+    progress_callbacks: ProgressCallbacks<'a>,
+}
+
+impl<'a, F, H> PackOptions<'a, F, H>
+where
+    F: BuildHasher,
+    F::Hasher: Clone,
+    H: BuildHasher,
+{
+    /// Create the [`PackOptions`] with non-optional parameters necessary for packing.
+    ///
+    /// `src_dir` is the path to the directory containing the source files to pack.
+    ///
+    /// `dst_dir` is the path to the directory (created if necessary) which will contain the resulting pack files.
+    ///
+    /// `filepath_hasher` is used to create [`PathHash`]'es from the source file relative paths whithin `src_dir`
+    /// to create the lookup data structure.
+    /// This same hasher must then be used when looking up the source file data in the created pack.
+    ///
+    /// `checksum_hasher` is used to calculate source file checksums and the pack's checksum / "version", returned by the call to [`PackOptions::pack`].
+    /// This same hasher must then be used when opening the pack for reading.
+    pub fn new(src_dir: PathBuf, dst_dir: PathBuf, filepath_hasher: F, checksum_hasher: H) -> Self {
+        Self {
+            src_dir,
+            dst_dir,
+            filepath_hasher,
+            checksum_hasher,
+            max_pack_size: None,
+            compression_callback: None,
+            write_file_tree: false,
+            num_workers: None,
+            memory_limit: None,
+            progress_callbacks: Default::default(),
+        }
+    }
+
+    /// The source file data is split into data pack files no larger then `max_pack_size` bytes
+    /// (unless an individual source file is larger than this value, in which case the data pack file
+    /// will be as large as the source file (and only contain this source file)).
+    ///
+    /// By default, if this is not called, all source file data will be put in a single data pack file.
+    pub fn max_pack_size(mut self, max_pack_size: u64) -> Self {
+        self.max_pack_size.replace(max_pack_size);
+        self
+    }
+
+    /// See [`CompressionCallback`].
+    pub fn compression_callback(mut self, compression_callback: Box<CompressionCallback>) -> Self {
+        self.compression_callback.replace(compression_callback);
+        self
+    }
+
+    /// `num_workers` determines the number of worker threads which will be spawned to compress source file data, if necessary.
+    /// If `0`, no worker threads are spawned, all processing is done on the current thread.
+    ///
+    /// By default, if this is not called, the number of worker threads is determined by [`std::thread::available_parallelism`]
+    /// (minus `1` for the current thread, which is also used for compression).
+    ///
+    /// Ignored if [`PackOptions::compression_callback`] is not specified.
+    pub fn num_workers(mut self, num_workers: usize) -> Self {
+        self.num_workers.replace(num_workers);
+        self
+    }
+
+    /// `memory_limit` determines the attempted best-effort limit on the amount of temporary memory
+    /// allocated at any given time for source file compression purposes
+    /// if using multiple threads for compression
+    /// (i.e. [`PackOptions::num_workers`] was called with a non-zero value, or if [`PackOptions::num_workers`] was not called
+    /// but [`std::thread::available_parallelism`] returned a positive value).
+    ///
+    /// NOTE: the limit will be exceeded if the required amount of memory to compress a single source file exceeds it in the first place.
+    /// NOTE: this value, if too low, may limit compression parallellism, as worker threads cannot
+    /// proceed with compression while waiting for temporary memory to become available.
+    /// As a rule of thumb, `memory_limit` should be approximately equal to `(num_workers + 1) * average_source_file_size`.
+    ///
+    /// By default, if this is not called, temporary memory use is not limited.
+    ///
+    /// Ignored if not using worker threads for compression.
+    /// Ignored if [`PackOptions::compression_callback`] is not specified.
+    pub fn memory_limit(mut self, memory_limit: u64) -> Self {
+        self.memory_limit.replace(memory_limit);
+        self
+    }
+
+    /// If `write_file_tree` is `true`, data necessary to unpack the file pack is serialized along with it.
+    ///
+    /// By default, if this is not called, the file tree is not written.
+    pub fn write_file_tree(mut self, write_file_tree: bool) -> Self {
+        self.write_file_tree = write_file_tree;
+        self
+    }
+
+    /// See [`OnSourceFilesGatheredCallback`].
+    pub fn on_source_files_gathered(
+        mut self,
+        on_source_files_gathered: Box<OnSourceFilesGatheredCallback<'a>>,
+    ) -> Self {
+        self.progress_callbacks
+            .on_source_files_gathered
+            .replace(on_source_files_gathered);
+        self
+    }
+
+    /// See [`BeforePackingCallback`].
+    pub fn before_packing(mut self, before_packing: Box<BeforePackingCallback<'a>>) -> Self {
+        self.progress_callbacks
+            .before_packing
+            .replace(before_packing);
+        self
+    }
+
+    /// See [`OnSourceFileProcessedCallback`].
+    pub fn on_source_file_processed(
+        mut self,
+        on_source_file_processed: Box<OnSourceFileProcessedCallback<'a>>,
+    ) -> Self {
+        self.progress_callbacks
+            .on_source_file_processed
+            .replace(on_source_file_processed);
+        self
+    }
+
+    /// See [`BeforeCompactionCallback`].
+    pub fn before_compaction(
+        mut self,
+        before_compaction: Box<BeforeCompactionCallback<'a>>,
+    ) -> Self {
+        self.progress_callbacks
+            .before_compaction
+            .replace(before_compaction);
+        self
+    }
+
+    /// See [`OnPackCompactedCallback`].
+    pub fn on_pack_compacted(
+        mut self,
+        on_pack_compacted: Box<OnPackCompactedCallback<'a>>,
+    ) -> Self {
+        self.progress_callbacks
+            .on_pack_compacted
+            .replace(on_pack_compacted);
+        self
+    }
+
+    /// See [`AfterCompactionCallback`].
+    pub fn after_compaction(mut self, after_compaction: Box<AfterCompactionCallback<'a>>) -> Self {
+        self.progress_callbacks
+            .after_compaction
+            .replace(after_compaction);
+        self
+    }
+
+    /// Consumes the [`PackOptions`] and begins packing.
+    ///
+    /// Iterates recursively over all (non-empty) source files in `src_dir`,
+    /// (optionally) compresses the source file data and packs it into the data pack files in `dst_dir`.
+    ///
+    /// Returns the [`Checksum`] of the generated pack.
+    pub fn pack(self) -> Result<Checksum, PackError> {
+        pack(
+            self.src_dir,
+            self.dst_dir,
+            self.max_pack_size,
+            self.filepath_hasher,
+            self.checksum_hasher,
+            self.compression_callback,
+            self.num_workers,
+            self.memory_limit,
+            self.write_file_tree,
+            self.progress_callbacks,
+        )
+    }
+}
+
+fn pack<F, H>(
+    mut src_dir: PathBuf,
+    mut dst_dir: PathBuf,
+    max_pack_size: Option<u64>,
+    filepath_hasher: F,
+    checksum_hasher: H,
+    compression_callback: Option<Box<CompressionCallback>>,
+    num_workers: Option<usize>,
+    memory_limit: Option<u64>,
+    write_file_tree: bool,
+    progress_callbacks: ProgressCallbacks,
 ) -> Result<Checksum, PackError>
 where
     F: BuildHasher,
     F::Hasher: Clone,
-    H: BuildHasher + Clone,
-    CCb: FnMut(&FilePath, &[u8]) -> bool,
-    PCb1: FnOnce(OnSourceFilesGathered) -> bool,
-    PCb2: FnMut(OnSourceFileProcessed),
+    H: BuildHasher,
 {
     use FileTreeWriterError::*;
 
@@ -133,10 +350,16 @@ where
         (path_hashes, file_tree, total_file_size)
     };
 
-    if !(progress_callbacks.on_source_files_gathered)(OnSourceFilesGathered {
-        num_files: path_hashes.len(),
-        total_file_size,
-    }) {
+    if !progress_callbacks
+        .on_source_files_gathered
+        .map(|on_source_files_gathered| {
+            on_source_files_gathered(OnSourceFilesGathered {
+                num_files: path_hashes.len(),
+                total_file_size,
+            })
+        })
+        .unwrap_or(true)
+    {
         return Err(PackError::Cancelled);
     }
 
@@ -144,7 +367,7 @@ where
     fs::create_dir_all(&dst_dir).map_err(|err| PackError::FailedToCreateOutputDirectory(err))?;
 
     let index = IndexWriter::new(checksum_hasher.build_hasher(), &mut dst_dir)?;
-    let packs = DataPackWriter::new(max_pack_len);
+    let packs = DataPackWriter::new(max_pack_size);
 
     // Sort the path hashes by file path string before processing to determine file data location in the data pack files.
     //
@@ -183,29 +406,51 @@ where
 
     // Calculate the number of worker threads we'll use,
     // and do single- or multi-threaded processing based on the result.
-    let num_workers = match num_workers {
-        Some(num_workers) => NonZeroUsize::new(num_workers),
-        // Subtract `1` for the main thread.
-        None => thread::available_parallelism()
-            .ok()
-            .and_then(|num_workers| NonZeroUsize::new(num_workers.get() - 1)),
-    };
+    //
+    // Don't need worker threads if we won't be using compression.
+    let num_workers = compression_callback.as_ref().and_then(|_| {
+        match num_workers {
+            Some(num_workers) => NonZeroUsize::new(num_workers),
+            // Subtract `1` for the main thread.
+            None => thread::available_parallelism()
+                .ok()
+                .and_then(|num_workers| NonZeroUsize::new(num_workers.get() - 1)),
+        }
+    });
 
     let (mut index_, mut packs) = if let Some(num_workers) = num_workers {
-        compress_multithreaded(
+        progress_callbacks.before_packing.map(|before_packing| {
+            before_packing(BeforePacking {
+                num_workers: num_workers.get(),
+            })
+        });
+
+        pack_multithreaded(
             src_dir,
             &dst_dir,
             packs,
             &file_tree,
             &checksum_hasher,
-            compression_callback,
+            unsafe {
+                debug_unwrap_option(
+                    compression_callback,
+                    "multithreaded packing requires a compression callback",
+                )
+            },
             num_workers,
             memory_limit,
             path_hashes,
             progress_callbacks.on_source_file_processed,
+            progress_callbacks.before_compaction,
+            progress_callbacks.on_pack_compacted,
+            progress_callbacks.after_compaction,
         )
     } else {
-        compress_singlethreaded(
+        progress_callbacks
+            .before_packing
+            .map(|before_packing| before_packing(BeforePacking { num_workers: 0 }));
+
+        pack_singlethreaded(
             src_dir,
             &dst_dir,
             packs,
@@ -243,21 +488,20 @@ where
     Ok(total_checksum)
 }
 
-fn compress_singlethreaded<F, H, CCbb>(
+fn pack_singlethreaded<F, H>(
     src_dir: PathBuf,
     dst_dir: &PathBuf,
     mut packs: DataPackWriter,
     file_tree: &FileTreeWriter<F>,
     checksum_hasher: &H,
-    mut compression_callback: CCbb,
+    mut compression_callback: Option<Box<CompressionCallback>>,
     path_hashes: Vec<PathHash>,
-    mut on_source_file_processed: impl FnMut(OnSourceFileProcessed),
+    mut on_source_file_processed: Option<Box<OnSourceFileProcessedCallback>>,
 ) -> Result<(Vec<(PathHash, IndexEntry)>, DataPackWriter), PackError>
 where
     F: BuildHasher,
     F::Hasher: Clone,
-    H: BuildHasher + Clone,
-    CCbb: FnMut(&FilePath, &[u8]) -> bool,
+    H: BuildHasher,
 {
     let mut file_path_builder = FilePathBuilder::new();
     let mut absolute_file_path = src_dir.clone();
@@ -270,23 +514,26 @@ where
 
     for path_hash in path_hashes {
         // Lookup the relative file path. Must succeed - all path hashes have been inserted.
-        let relative_file_path = lookup_path(&file_tree, path_hash, file_path_builder);
+        let file_path = lookup_path(&file_tree, path_hash, file_path_builder);
 
         // Build the absolute file path.
-        absolute_file_path.push(relative_file_path.as_path());
+        absolute_file_path.push(file_path.as_path());
 
         // Open and map the source file.
         let src_file = || -> _ { unsafe { Mmap::map(&File::open(&absolute_file_path)?) } }()
-            .map_err(|err| PackError::FailedToOpenSourceFile((relative_file_path.clone(), err)))?;
+            .map_err(|err| PackError::FailedToOpenSourceFile((file_path.clone(), err)))?;
 
         // Call the compression callback, passing the relative file path and the file data.
-        let compress = compression_callback(&relative_file_path, &src_file);
+        let compress = compression_callback
+            .as_mut()
+            .map(|compression_callback| compression_callback(&file_path, &src_file))
+            .unwrap_or(false);
 
         // Try to compress the file data if the compression callback specified it.
         let (compressed, file_data) = if compress {
             compressor
                 .compress_into_vec(&src_file, &mut compressed_data, false)
-                .map_err(|_| PackError::FailedToCompress(relative_file_path.clone()))?;
+                .map_err(|_| PackError::FailedToCompress(file_path.clone()))?;
 
             // Do not compress if the source file data is incompressible.
             if compressed_data.len() >= src_file.len() {
@@ -328,13 +575,18 @@ where
         ));
 
         // Call the progress callback.
-        (on_source_file_processed)(OnSourceFileProcessed {
-            src_file_size: src_file.len() as _,
-            packed_file_size: file_data.len() as _,
-        });
+        on_source_file_processed
+            .as_mut()
+            .map(|on_source_file_processed| {
+                on_source_file_processed(OnSourceFileProcessed {
+                    src_file_size: src_file.len() as _,
+                    packed_file_size: file_data.len() as _,
+                    num_packs: packs.num_packs(),
+                })
+            });
 
         // Reset the relative and absolute paths.
-        file_path_builder = relative_file_path.into_builder();
+        file_path_builder = file_path.into_builder();
         absolute_file_path.clear();
         absolute_file_path.push(&src_dir);
     }
@@ -342,24 +594,25 @@ where
     Ok((hashes_and_index_entries, packs))
 }
 
-fn compress_multithreaded<F, H, CCb, PCb>(
+fn pack_multithreaded<F, H>(
     src_dir: PathBuf,
     dst_dir: &PathBuf,
     mut packs: DataPackWriter,
     file_tree: &FileTreeWriter<F>,
     checksum_hasher: &H,
-    mut compression_callback: CCb,
+    mut compression_callback: Box<CompressionCallback>,
     num_workers: NonZeroUsize,
     memory_limit: Option<u64>,
     path_hashes: Vec<PathHash>,
-    mut on_source_file_processed: PCb,
+    mut on_source_file_processed: Option<Box<OnSourceFileProcessedCallback>>,
+    before_compaction: Option<Box<BeforeCompactionCallback>>,
+    on_pack_compacted: Option<Box<OnPackCompactedCallback>>,
+    after_compaction: Option<Box<AfterCompactionCallback>>,
 ) -> Result<(Vec<(PathHash, IndexEntry)>, DataPackWriter), PackError>
 where
     F: BuildHasher,
     F::Hasher: Clone,
-    H: BuildHasher + Clone,
-    CCb: FnMut(&FilePath, &[u8]) -> bool,
-    PCb: FnMut(OnSourceFileProcessed),
+    H: BuildHasher,
 {
     let mut file_path_builder = FilePathBuilder::new();
     let mut absolute_file_path = src_dir.clone();
@@ -437,17 +690,17 @@ where
 
     for (insert_index, &path_hash) in path_hashes.iter().enumerate() {
         // Lookup the relative file path. Must succeed - all path hashes have been inserted.
-        let relative_file_path = lookup_path(&file_tree, path_hash, file_path_builder);
+        let file_path = lookup_path(&file_tree, path_hash, file_path_builder);
 
         // Build the absolute file path.
-        absolute_file_path.push(relative_file_path.as_path());
+        absolute_file_path.push(file_path.as_path());
 
         // Open and map the source file.
         let src_file = || -> _ { unsafe { Mmap::map(&File::open(&absolute_file_path)?) } }()
-            .map_err(|err| PackError::FailedToOpenSourceFile((relative_file_path.clone(), err)))?;
+            .map_err(|err| PackError::FailedToOpenSourceFile((file_path.clone(), err)))?;
 
         // Call the compression callback, passing the relative file path and the file data.
-        if compression_callback(&relative_file_path, &src_file) {
+        if compression_callback(&file_path, &src_file) {
             let uncompressed_size = src_file.len() as FileSize;
             let task = CompressionTask {
                 path_hash,
@@ -477,17 +730,17 @@ where
                 path_hash,
                 src_file,
                 None,
-                &mut on_source_file_processed,
+                on_source_file_processed.as_mut(),
             )?;
         }
 
         // Reset the relative and absolute paths.
-        file_path_builder = relative_file_path.into_builder();
+        file_path_builder = file_path.into_builder();
         absolute_file_path.clear();
         absolute_file_path.push(&src_dir);
 
-        // Try to process a single compression result each iteration
-        // to relieve allocator pressure if we use a memory limit.
+        // If we use a memory limit, try to process a single compression result each iteration
+        // to relieve allocator pressure.
         if memory_limit.is_some() {
             if let Some(result) = thread_pool.try_pop_result() {
                 process_result(
@@ -498,16 +751,17 @@ where
                     &mut index,
                     result,
                     &file_path_builder,
-                    &mut on_source_file_processed,
+                    on_source_file_processed.as_mut(),
                 )?;
             }
         }
     }
 
-    let mut compressor = Compressor::new().expect("failed to create an LZ4 compressor");
-
     // Signal the thread pool there will be no more tasks.
     thread_pool.finish();
+
+    // Create the compressor the main thread will use.
+    let mut compressor = Compressor::new().expect("failed to create an LZ4 compressor");
 
     // Process the results and help out with tasks if there are no results ready.
     while let Some(result_or_task) = thread_pool.pop_result_or_task() {
@@ -521,12 +775,12 @@ where
                     &mut index,
                     result,
                     &file_path_builder,
-                    &mut on_source_file_processed,
+                    on_source_file_processed.as_mut(),
                 )?;
             }
             ResultOrTask::Task(task) => {
                 // Try to allocate memory for the compression task.
-                // Do not block, return the task to the queue on failure.
+                // Do not block, return the task back to the queue on failure.
                 // NOTE - task queue is FIFO, so we won't just pick up the same task again on the next iteration of this loop.
                 if let Some(allocation) = allocate(task.src_file.len() as _, /* block */ false) {
                     compress_file(
@@ -538,7 +792,7 @@ where
                         &file_path_builder,
                         allocation,
                         &mut compressor,
-                        &mut on_source_file_processed,
+                        on_source_file_processed.as_mut(),
                     )?;
                 } else {
                     thread_pool.push(task);
@@ -547,6 +801,7 @@ where
         }
     }
 
+    // Wait for all worker threads to exit.
     mem::drop(thread_pool);
 
     // Process the large files.
@@ -568,19 +823,24 @@ where
             &file_path_builder,
             allocation,
             &mut compressor,
-            &mut on_source_file_processed,
+            on_source_file_processed.as_mut(),
         )?;
     }
 
-    // Compact the data packs.
-    packs.compact(&mut index)?;
+    // Compact the data pack files if necessary.
+    packs.compact(
+        &mut index,
+        before_compaction,
+        on_pack_compacted,
+        after_compaction,
+    )?;
 
     Ok((index, packs))
 }
 
 /// Handles files which do not require compression (in which case `pack_index` is `None`),
 /// or which where incomressible (in which case `pack_index` is `Some`, as returned by `packs.reserve()`).
-fn process_uncompressed_file<H, PCb>(
+fn process_uncompressed_file<H>(
     dst_dir: &PathBuf,
     checksum_hasher: &H,
     packs: &mut DataPackWriter,
@@ -589,11 +849,10 @@ fn process_uncompressed_file<H, PCb>(
     path_hash: PathHash,
     src_file: Mmap,
     pack_index: Option<PackIndex>,
-    on_source_file_processed: &mut PCb,
+    on_source_file_processed: Option<&mut Box<OnSourceFileProcessedCallback>>,
 ) -> Result<(), PackError>
 where
     H: BuildHasher,
-    PCb: FnMut(OnSourceFileProcessed),
 {
     // If we have reserved space in a pack, write to it.
     let (pack_index, offset) = if let Some(pack_index) = pack_index {
@@ -607,6 +866,7 @@ where
     debug_assert!(insert_index < index.len());
     let index_entry = unsafe { index.get_unchecked_mut(insert_index) };
 
+    debug_assert_eq!(index_entry.0, 0);
     debug_assert_eq!(index_entry.1.len, 0);
     *index_entry = (
         path_hash,
@@ -620,39 +880,42 @@ where
     );
 
     // Call the progress callback.
-    on_source_file_processed(OnSourceFileProcessed {
-        src_file_size: src_file.len() as _,
-        packed_file_size: src_file.len() as _,
+    on_source_file_processed.map(|on_source_file_processed| {
+        on_source_file_processed(OnSourceFileProcessed {
+            src_file_size: src_file.len() as _,
+            packed_file_size: src_file.len() as _,
+            num_packs: packs.num_packs(),
+        })
     });
 
     Ok(())
 }
 
-// A compression task sent to the thread pool from the main thread.
+/// A compression task sent to the thread pool from the main thread.
 struct CompressionTask {
-    // Mapped source file data.
+    /// Mapped source file data.
     src_file: Mmap,
-    // Reserved data pack file index for this source file.
+    /// Reserved data pack file index for this source file.
     pack_index: PackIndex,
-    // Needed for error reporting (to lookup the file name).
+    /// Needed for error reporting (to lookup the file name).
     path_hash: PathHash,
-    // Needed to avoid re-sorting the (path hash, index entry) result index array in file path alphabetic order
-    // after non-deterministic multithreaded compression.
-    // Index must be sorted in alphabetic order, same as for singlethreaded processing
-    // for deterministic results.
+    /// Needed to avoid re-sorting the (path hash, index entry) result index array in file path alphabetic order
+    /// after non-deterministic multithreaded compression.
+    /// Index must be sorted in alphabetic order, same as for singlethreaded processing,
+    /// for deterministic results.
     insert_index: usize,
 }
 
-// Compressed source file data buffer allocated by the worker thread.
+/// Compressed source file data buffer allocated by the worker thread.
 struct CompressedBuffer<'a> {
-    // The entire allocation for this buffer.
+    /// The entire allocation for this buffer.
     allocation: Allocation<'a>,
-    // Actual compressed source file data size in bytes within the buffer.
+    /// Actual compressed source file data size in bytes within the buffer.
     compressed_size: NonZeroU64,
 }
 
 impl<'a> CompressedBuffer<'a> {
-    // Returns the subslice of the allocation with the compressed source file data.
+    /// Returns the subslice of the allocation with the compressed source file data.
     fn compressed(&self) -> &[u8] {
         debug_assert!(self.compressed_size.get() <= self.allocation.len() as FileSize);
         unsafe {
@@ -664,9 +927,9 @@ impl<'a> CompressedBuffer<'a> {
 
 struct CompressionResult<'a> {
     task: CompressionTask,
-    // `Ok(Some)` if succesfully compressed.
-    // `Ok(None)` if source file data was incompressible.
-    // `Err` if failed to compress.
+    /// `Ok(Some)` if succesfully compressed.
+    /// `Ok(None)` if source file data was incompressible.
+    /// `Err` if failed to compress.
     compressed: Result<Option<CompressedBuffer<'a>>, CompressorError>,
 }
 
@@ -687,7 +950,7 @@ where
     }
 }
 
-fn compress_file<H, F, PCb>(
+fn compress_file<H, F>(
     checksum_hasher: &H,
     packs: &mut DataPackWriter,
     index: &mut Vec<(PathHash, IndexEntry)>,
@@ -696,13 +959,12 @@ fn compress_file<H, F, PCb>(
     file_path_builder: &FilePathBuilder,
     mut allocation: Allocation<'_>,
     compressor: &mut Compressor,
-    on_source_file_processed: &mut PCb,
+    on_source_file_processed: Option<&mut Box<OnSourceFileProcessedCallback>>,
 ) -> Result<(), PackError>
 where
     H: BuildHasher,
     F: BuildHasher,
     F::Hasher: Clone,
-    PCb: FnMut(OnSourceFileProcessed),
 {
     // Try to compress the file data.
     let compressed_size = compressor
@@ -737,6 +999,7 @@ where
     debug_assert!(task.insert_index < index.len());
     let index_entry = unsafe { index.get_unchecked_mut(task.insert_index) };
 
+    debug_assert_eq!(index_entry.0, 0);
     debug_assert_eq!(index_entry.1.len, 0);
     *index_entry = (
         task.path_hash,
@@ -754,15 +1017,18 @@ where
     );
 
     // Call the progress callback.
-    on_source_file_processed(OnSourceFileProcessed {
-        src_file_size: task.src_file.len() as _,
-        packed_file_size: file_data.len() as _,
+    on_source_file_processed.map(|on_source_file_processed| {
+        on_source_file_processed(OnSourceFileProcessed {
+            src_file_size: task.src_file.len() as _,
+            packed_file_size: file_data.len() as _,
+            num_packs: packs.num_packs(),
+        })
     });
 
     Ok(())
 }
 
-fn process_result<F, H, PCb>(
+fn process_result<F, H>(
     dst_dir: &PathBuf,
     file_tree: &FileTreeWriter<F>,
     checksum_hasher: &H,
@@ -770,13 +1036,12 @@ fn process_result<F, H, PCb>(
     index: &mut Vec<(PathHash, IndexEntry)>,
     result: CompressionResult,
     file_path_builder: &FilePathBuilder,
-    on_source_file_processed: &mut PCb,
+    on_source_file_processed: Option<&mut Box<OnSourceFileProcessedCallback>>,
 ) -> Result<(), PackError>
 where
     F: BuildHasher,
     F::Hasher: Clone,
     H: BuildHasher,
-    PCb: FnMut(OnSourceFileProcessed),
 {
     // Write the source file's data (compressed or original) to the reserved data pack file.
     if let Some(compressed) = result.compressed.map_err(|_| {
@@ -792,6 +1057,7 @@ where
         debug_assert!(result.task.insert_index < index.len());
         let index_entry = unsafe { index.get_unchecked_mut(result.task.insert_index) };
 
+        debug_assert_eq!(index_entry.0, 0);
         debug_assert_eq!(index_entry.1.len, 0);
         *index_entry = (
             result.task.path_hash,
@@ -805,9 +1071,12 @@ where
         );
 
         // Call the progress callback.
-        on_source_file_processed(OnSourceFileProcessed {
-            src_file_size: result.task.src_file.len() as _,
-            packed_file_size: compressed.len() as _,
+        on_source_file_processed.map(|on_source_file_processed| {
+            on_source_file_processed(OnSourceFileProcessed {
+                src_file_size: result.task.src_file.len() as _,
+                packed_file_size: compressed.len() as _,
+                num_packs: packs.num_packs(),
+            })
         });
     } else {
         // Source file was incompressible.

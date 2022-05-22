@@ -63,7 +63,10 @@ fn main() {
     let mut dst_dir = root_dir;
     dst_dir.push("packed");
 
-    let do_packing = |num_workers: Option<usize>, memory_limit: Option<u64>| -> Checksum {
+    let pack_impl = |max_pack_size: u64,
+                     num_workers: Option<usize>,
+                     memory_limit: Option<u64>|
+     -> (Checksum, std::time::Duration, Option<std::time::Duration>) {
         let num_files = std::cell::RefCell::new(0);
         let mut num_processed_files = 0;
         let mut num_compressed_files = 0;
@@ -71,26 +74,43 @@ fn main() {
         let mut processed_data_size = 0;
         let mut packed_data_size = 0;
 
-        pack(
+        let start = std::time::Instant::now();
+        let mut compaction_start = None;
+        let mut compaction_end = None;
+
+        let mut pack_options = PackOptions::new(
             target_dir.clone(),
             dst_dir.clone(),
-            4 * 1024 * 1024,
             BuildFNV1AHasher,
-            BuildSeaHasher,
+            BuildSeaHasher
+        )
+        .max_pack_size(
+            max_pack_size
+        )
+        .compression_callback(Box::new(
             |_path: &FilePath, _file_data: &[u8]| {
                     true
-            },
-            true,
-            num_workers,
-            memory_limit,
-            ProgressCallbacks {
-                on_source_files_gathered: |arg: OnSourceFilesGathered| {
-                    *num_files.borrow_mut() = arg.num_files;
-                    *src_data_size.borrow_mut()= arg.total_file_size;
-                    println!("Found {} files, {:.2} Mb total, in \"{}\"", arg.num_files, (arg.total_file_size as f64) / 1024.0 / 1024.0, target_dir.as_os_str().to_string_lossy());
-                    true
-                },
-                on_source_file_processed: |arg: OnSourceFileProcessed| {
+            }
+        )).write_file_tree(
+            true)
+        .on_source_files_gathered(Box::new(
+            |arg: OnSourceFilesGathered| {
+                *num_files.borrow_mut() = arg.num_files;
+                *src_data_size.borrow_mut()= arg.total_file_size;
+                println!("Found {} files, {:.2} Mb total, in \"{}\"", arg.num_files, (arg.total_file_size as f64) / 1024.0 / 1024.0, target_dir.as_os_str().to_string_lossy());
+                true
+            })
+        )
+        .before_packing(Box::new(|arg: BeforePacking| {
+                if arg.num_workers > 0 {
+                    println!("Packing with {} worker threads.", arg.num_workers);
+                } else {
+                    println!("Packing in singlethreaded mode.");
+                }
+            })
+        )
+        .on_source_file_processed(Box::new(
+                |arg: OnSourceFileProcessed| {
                     processed_data_size += arg.src_file_size;
                     packed_data_size += arg.packed_file_size;
                     num_processed_files += 1;
@@ -101,12 +121,13 @@ fn main() {
                     }
 
                     print!(
-                        "\rProcessed {:4} / {:4} files ({:.2} / {:.2} Mb), wrote {:.2} Mb (compressed {:4} to {:.2}%)\t",
+                        "\rProcessed {:4} / {:4} files ({:.2} / {:.2} Mb), wrote {:.2} Mb in {:2} packs (compressed {:4} files to {:.2}%)\t",
                         num_processed_files,
                         *num_files.borrow(),
                         (processed_data_size as f64) / 1024.0 / 1024.0,
                         (*src_data_size.borrow() as f64) / 1024.0 / 1024.0,
                         (packed_data_size as f64) / 1024.0 / 1024.0,
+                        arg.num_packs,
                         num_compressed_files,
                         (packed_data_size as f64) / (processed_data_size as f64) * 100.0
                     );
@@ -116,28 +137,77 @@ fn main() {
                     if num_processed_files == *num_files.borrow() {
                         println!();
                     }
-                },
-            }
+                })
         )
-        .unwrap()
+        .before_compaction(Box::new(|arg: BeforeCompaction| {
+                    compaction_start.replace(std::time::Instant::now());
+                    println!("Compacting {} packs.", arg.num_packs);
+                })
+            )
+        .on_pack_compacted(Box::new(
+                |arg: OnPackCompacted| {
+                    print!("\rCompacted pack {:2} of {:2}.", arg.pack_index, arg.num_packs);
+                    use std::io::Write;
+                    std::io::stdout().flush().unwrap();
+
+                    if arg.pack_index == arg.num_packs - 1 {
+                        println!();
+                    }
+                })
+            ).after_compaction(Box::new(|arg: AfterCompaction| {
+                    compaction_end.replace(std::time::Instant::now());
+                    println!("Compacted {} packs into {}.", arg.num_packs_before_compaction, arg.num_packs);
+                }));
+
+        if let Some(num_workers) = num_workers {
+            pack_options = pack_options.num_workers(num_workers);
+        }
+
+        if let Some(memory_limit) = memory_limit {
+            pack_options = pack_options.memory_limit(memory_limit);
+        }
+
+        let checksum = pack_options.pack().unwrap();
+
+        let duration = std::time::Instant::now().duration_since(start);
+
+        let compaction_duration = if let Some(compaction_start) = compaction_start {
+            if let Some(compaction_end) = compaction_end {
+                Some(compaction_end.duration_since(compaction_start))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        (checksum, duration, compaction_duration)
     };
 
-    // Use automatic detection.
+    let max_pack_size = 4 * 1024 * 1024;
     let num_workers = None;
-    let memory_limit = None;//Some(8 * 1024 * 1024);
+    let memory_limit = None;
 
-    let start = std::time::Instant::now();
-    let checksum_mt = do_packing(num_workers, memory_limit);
-    let duration = std::time::Instant::now().duration_since(start);
+    let (checksum_mt, duration, compaction_duration) =
+        pack_impl(max_pack_size, num_workers, memory_limit);
 
-    println!("Finished (multithreaded) in {} sec", duration.as_secs_f32());
+    if let Some(compaction_duration) = compaction_duration {
+        println!(
+            "Finished (multithreaded) in {:.2} sec (incl. {:.2} sec for compaction)",
+            duration.as_secs_f32(),
+            compaction_duration.as_secs_f32()
+        );
+    } else {
+        println!(
+            "Finished (multithreaded) in {:.2} sec",
+            duration.as_secs_f32(),
+        );
+    }
 
-    let start = std::time::Instant::now();
-    let checksum_st = do_packing(Some(0), None);
-    let duration = std::time::Instant::now().duration_since(start);
+    let (checksum_st, duration, _) = pack_impl(max_pack_size, Some(0), None);
 
     println!(
-        "Finished (singlethreaded) in {} sec",
+        "Finished (singlethreaded) in {:.2} sec",
         duration.as_secs_f32()
     );
 

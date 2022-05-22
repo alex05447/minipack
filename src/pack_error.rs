@@ -9,7 +9,7 @@ use {
     },
 };
 
-/// An error returned by [`pack()`].
+/// An error returned by [`PackOptions::pack`].
 #[derive(Debug)]
 pub enum PackError {
     /// Failed to iterate files in the source directory.
@@ -21,6 +21,9 @@ pub enum PackError {
     InvalidSourceFileName((PathBuf, FilePathError)),
     /// Failed to open the source file.
     /// Contains the relative path to the source file and the actual IO error.
+    ///
+    /// This might happen if the source directory was modified after it was scanned for source files
+    /// and before the source file was processed.
     FailedToOpenSourceFile((FilePathBuf, io::Error)),
     /// Encountered a file path corresponding to an already processed folder.
     /// Contains the relative path to the processed folder.
@@ -46,7 +49,7 @@ pub enum PackError {
     /// Failed to write the strings file.
     /// Contains the actual IO error.
     FailedToWriteStringsFile(io::Error),
-
+    /// Packing was cancelled by the user.
     Cancelled,
 }
 
@@ -69,8 +72,7 @@ impl Display for PackError {
             FailedToWriteIndexFile(err) => write!(f, "failed to write to the index file: {}", err),
             FailedToWritePackFile((idx, err)) => write!(f, "failed to write to the data pack file {}: {}", idx, err),
             FailedToWriteStringsFile(err) => write!(f, "failed to write to the strings file: {}", err),
-
-            Cancelled => "cancelled".fmt(f),
+            Cancelled => "packing was cancelled by the user".fmt(f),
         }
     }
 }

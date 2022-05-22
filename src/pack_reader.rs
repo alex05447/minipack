@@ -68,7 +68,7 @@ impl PackReader {
     ///
     /// `checksum_hasher` - hasher used to validate the index checksum,
     /// and, if `validate_checksum` is `true`, to validate the individual resource file data checksums.
-    /// Must match the `checksum_hasher` used when [`packing`](pack()); otherwise an error will be returned
+    /// Must match the `checksum_hasher` used when [`packing`](PackOptions::pack); otherwise an error will be returned
     /// ([`PackReaderError::CorruptData`] if `validate_checksum` is `true`, [`PackReaderError::InvalidChecksum`] otherwise).
     ///
     /// `expected_checksum` - if `Some`, this declares the expected checksum / "version" of the opened pack

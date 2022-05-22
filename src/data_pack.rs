@@ -89,7 +89,7 @@ impl DataPack {
 
             // Write the dummy data pack file header.
             // Header will be updated with the correct checksum later,
-            // after the total pack checksum is calculated when all resource files are processed.
+            // after the total pack checksum is calculated when all source files are processed.
             DataPackHeader::write(0, &mut file)?;
 
             Ok((file, path))
@@ -104,11 +104,11 @@ impl DataPack {
         })
     }
 
-    fn remaining(&self, max_pack_len: Offset) -> Offset {
+    fn remaining(&self, max_pack_size: Offset) -> Offset {
         let header_size = mem::size_of::<DataPackHeader>() as Offset;
 
-        debug_assert!(max_pack_len > header_size);
-        let payload_size = max_pack_len - header_size;
+        debug_assert!(max_pack_size > header_size);
+        let payload_size = max_pack_size - header_size;
 
         // NOTE: `offset` might be larger than maximum payload size if the data pack file contains a single large file.
         payload_size.saturating_sub(self.offset + self.reserved)
@@ -264,9 +264,7 @@ impl DataPack {
         // For all source files which remained in this data pack file and which need to be moved/compacted/defragmented
         // (i.e. at least one source file located before them in the data pack was moved to a different data pack, leaving a hole) ...
         let mut new_offset = 0;
-        for (pack_file, new_offset_) in pack_files
-            .iter_mut()
-            .filter_map(|(_, pack_file)| {
+        for (pack_file, new_offset_) in pack_files.iter_mut().filter_map(|(_, pack_file)| {
             if pack_file.pack_index == pack_index {
                 let offset = new_offset;
                 new_offset += pack_file.len;
@@ -324,14 +322,15 @@ pub(crate) struct DataPackWriter {
     // (in which case the data pack file will only contain this file's data).
     //
     // TODO: revisit this.
-    max_pack_len: Offset,
+    max_pack_size: Option<Offset>,
 }
 
 impl DataPackWriter {
-    pub(crate) fn new(max_pack_len: u64) -> Self {
+    pub(crate) fn new(max_pack_size: Option<u64>) -> Self {
         Self {
             packs: Vec::new(),
-            max_pack_len: max_pack_len.max(min_data_pack_size()),
+            max_pack_size: max_pack_size
+                .map(|max_pack_size| max_pack_size.max(min_data_pack_size())),
         }
     }
 
@@ -441,10 +440,37 @@ impl DataPackWriter {
     /// will not result in the same pack index selection as the singlethreaded packing process.
     ///
     /// This modifies the index entries in `index` for moved source files with new pack indices and data offsets.
+    ///
+    /// NOTE: does nothing if we don't use a data pack file size limit, or if there's only one data pack file.
     pub(crate) fn compact(
         &mut self,
         index: &mut [(PathHash, IndexEntry)],
+        before_compaction: Option<Box<BeforeCompactionCallback>>,
+        mut on_pack_compacted: Option<Box<OnPackCompactedCallback>>,
+        after_compaction: Option<Box<AfterCompactionCallback>>,
     ) -> Result<(), PackError> {
+        // There's only one data pack file if we don't use a data pack file size limit.
+        let max_pack_size = if let Some(max_pack_size) = self.max_pack_size {
+            max_pack_size
+        } else {
+            debug_assert_eq!(self.packs.len(), 1);
+            return Ok(());
+        };
+
+        let prev_num_packs = self.num_packs();
+
+        // Call the progress callback.
+        before_compaction.map(|before_compaction| {
+            before_compaction(BeforeCompaction {
+                num_packs: prev_num_packs,
+            })
+        });
+
+        // No need for compaction if there's only one data pack file (or even none at all).
+        if prev_num_packs <= 1 {
+            return Ok(());
+        }
+
         // Generate the deterministic pack index lookup for the file path hashes from `index`,
         // using their now-known compressed sizes.
         let pack_index_lookup = {
@@ -460,11 +486,11 @@ impl DataPackWriter {
                     Self { offset: 0 }
                 }
 
-                fn remaining(&self, max_pack_len: Offset) -> Offset {
+                fn remaining(&self, max_pack_size: Offset) -> Offset {
                     let header_size = mem::size_of::<DataPackHeader>() as Offset;
 
-                    debug_assert!(max_pack_len > header_size);
-                    let payload_size = max_pack_len - header_size;
+                    debug_assert!(max_pack_size > header_size);
+                    let payload_size = max_pack_size - header_size;
 
                     payload_size.saturating_sub(self.offset)
                 }
@@ -476,14 +502,14 @@ impl DataPackWriter {
 
             struct VirtualPacks {
                 packs: Vec<VirtualPack>,
-                max_pack_len: Offset,
+                max_pack_size: Offset,
             }
 
             impl VirtualPacks {
-                fn new(max_pack_len: Offset) -> Self {
+                fn new(max_pack_size: Offset) -> Self {
                     Self {
                         packs: Vec::new(),
-                        max_pack_len,
+                        max_pack_size,
                     }
                 }
 
@@ -492,7 +518,7 @@ impl DataPackWriter {
                     let pack_index = self
                         .packs
                         .iter()
-                        .position(|pack| pack.remaining(self.max_pack_len) >= len)
+                        .position(|pack| pack.remaining(self.max_pack_size) >= len)
                         .unwrap_or_else(|| {
                             let pack_index = self.packs.len();
                             self.packs.push(VirtualPack::new());
@@ -508,7 +534,7 @@ impl DataPackWriter {
                 }
             }
 
-            let mut virtual_packs = VirtualPacks::new(self.max_pack_len);
+            let mut virtual_packs = VirtualPacks::new(max_pack_size);
 
             index
                 .iter()
@@ -524,7 +550,8 @@ impl DataPackWriter {
 
         // Compact each data pack file in order, moving source file data as necessary from it to other data pack files
         // and defragmenting the moved-from pack.
-        for pack_index in 0..self.packs.len() as PackIndex {
+        let num_packs = self.packs.len() as PackIndex;
+        for pack_index in 0..num_packs {
             pack_files_buf = packs.get(pack_index).compact(
                 pack_index,
                 packs,
@@ -532,6 +559,14 @@ impl DataPackWriter {
                 index,
                 pack_files_buf,
             )?;
+
+            // Call the progress callback.
+            on_pack_compacted.as_mut().map(|on_pack_compacted| {
+                on_pack_compacted(OnPackCompacted {
+                    pack_index,
+                    num_packs,
+                })
+            });
         }
 
         // Remove data pack files which were left empty after compaction.
@@ -542,6 +577,14 @@ impl DataPackWriter {
             } else {
                 true
             }
+        });
+
+        // Call the progress callback.
+        after_compaction.map(|after_compaction| {
+            after_compaction(AfterCompaction {
+                num_packs_before_compaction: prev_num_packs,
+                num_packs: self.num_packs(),
+            })
         });
 
         Ok(())
@@ -557,11 +600,12 @@ impl DataPackWriter {
         data_size: FileSize,
         path: &PathBuf,
     ) -> Result<(PackIndex, &mut DataPack), PackError> {
-        let pack_index = if let Some(pack_index) = self
-            .packs
-            .iter()
-            .position(|pack| pack.remaining(self.max_pack_len) >= data_size)
-        {
+        let pack_index = if let Some(pack_index) = self.packs.iter().position(|pack| {
+            self.max_pack_size
+                .map(|max_pack_size| pack.remaining(max_pack_size) >= data_size)
+                // Use the first pack if no data pack file size limit.
+                .unwrap_or(true)
+        }) {
             pack_index as PackIndex
         } else {
             let pack_index = self.packs.len();
@@ -573,6 +617,10 @@ impl DataPackWriter {
         let pack = unsafe { self.packs.get_unchecked_mut(pack_index as usize) };
 
         Ok((pack_index, pack))
+    }
+
+    pub(crate) fn num_packs(&self) -> PackIndex {
+        self.packs.len() as _
     }
 }
 

@@ -94,7 +94,22 @@ mod util;
 
 pub(crate) use {allocator::*, data_pack::*, index::*, thread_pool::*, util::*};
 
+/// Checksum / "version" of the generated resource pack.
+///
+/// Deterministic and determined by the [`options`](PackOptions::new) used for packing, as well as
+/// - resource file paths,
+/// - resource file content,
+/// - data pack file [`size limit`](PackOptions::max_pack_size) (via index of the data pack file a resource file is placed into).
+///
+/// I.e. same content and same packing options always result in the same checksum.
+///
+/// NOTE: currently, generated data pack files are not guaranteed to be byte-for-byte identical and deterministic
+/// between consectutive packings, especially when using multithreaded packing / compression,
+/// due to the location / offset of any given resource file within a data pack file not being deterministic.
+/// The resource file content, however, as stored in the data pack file during [`packing`](PackOptions::pack)
+/// and as accessed by the [`PackReader`], is, of course, completely the same.
 pub type Checksum = u64;
+
 pub(crate) type PackIndex = u16;
 pub(crate) type Offset = u64;
 pub(crate) type FileSize = u64;
