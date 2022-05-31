@@ -701,9 +701,7 @@ impl DataPackReader {
     /// The caller guarantees `offset` and `len` are valid.
     pub(crate) unsafe fn slice(&self, offset: Offset, len: FileSize) -> &[u8] {
         let data = self.data();
-
         debug_assert!(offset + len <= data.len() as _);
-
         data.get_unchecked(offset as usize..(offset + len) as usize)
     }
 

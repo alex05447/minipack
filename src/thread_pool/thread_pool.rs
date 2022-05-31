@@ -89,15 +89,9 @@ where
     ///
     /// When `Drop`'ped, cancels unfinished tasks, if any.
     /// Calls the `waker`, if any, to wake up the worker threads before waiting for them to exit.
-    pub(crate) fn new<I, C, F>(
-        num_workers: NonZeroUsize,
-        mut init_context: I,
-        f: F,
-        waker: W,
-    ) -> Self
+    pub(crate) fn new<I, C, F>(num_workers: NonZeroUsize, init_context: I, f: F, waker: W) -> Self
     where
-        I: FnMut(usize) -> C,
-        C: 'static + Send,
+        I: FnOnce(usize) -> C + Clone + Send + 'static,
         F: FnMut(&mut C, T) -> Option<R> + Send + Sync + Clone + 'env,
         T: 'env + Send,
         R: 'env + Send,
@@ -137,11 +131,13 @@ where
                     })
                 });
 
-                let mut context = init_context(worker_index);
+                let init_context = init_context.clone();
 
                 thread::Builder::new()
                     .name(format!("Worker thread {}", worker_index))
                     .spawn(move || {
+                        let mut context = init_context(worker_index);
+
                         // Safe:
                         //worker_loop_impl(&mut context);
 
@@ -169,14 +165,12 @@ where
         self.num_tasks += 1;
     }
 
-    /*
-    /// Called from the main thread.
-    /// Adds all the `tasks` from the iterator to the queue, wakes up all workers.
+    // Called from the main thread.
+    // Adds all the `tasks` from the iterator to the queue, wakes up all workers.
     pub(crate) fn push_tasks<I: Iterator<Item = T>>(&mut self, tasks: I) {
         let num_tasks = self.task_queue.push_tasks(tasks);
         self.num_tasks += num_tasks;
     }
-    */
 
     /// Called from the main thread.
     /// Signals the worker threads to finish any remaining tasks and exit, as no new tasks will be added.

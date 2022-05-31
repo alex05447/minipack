@@ -7,6 +7,8 @@ use {
         env,
         hash::{BuildHasher, Hash, Hasher},
     },
+    tracing_chrome::*,
+    tracing_subscriber::prelude::*,
 };
 
 #[derive(Default, Clone, Copy)]
@@ -59,8 +61,8 @@ fn main() {
     let root_dir = env::current_dir().expect("failed to get the current directory");
     // "... minifiletree/target"
     let mut target_dir = root_dir.clone();
-    target_dir.push("target");
-    let mut dst_dir = root_dir;
+    target_dir.push("target_");
+    let mut dst_dir = root_dir.clone();
     dst_dir.push("packed");
 
     let pack_impl = |max_pack_size: u64,
@@ -204,14 +206,18 @@ fn main() {
         );
     }
 
-    let (checksum_st, duration, _) = pack_impl(max_pack_size, Some(0), None);
+    let pack_singlethreaded = false;
 
-    println!(
-        "Finished (singlethreaded) in {:.2} sec",
-        duration.as_secs_f32()
-    );
+    if pack_singlethreaded {
+        let (checksum_st, duration, _) = pack_impl(max_pack_size, Some(0), None);
 
-    assert_eq!(checksum_mt, checksum_st);
+        println!(
+            "Finished (singlethreaded) in {:.2} sec",
+            duration.as_secs_f32()
+        );
+
+        assert_eq!(checksum_mt, checksum_st);
+    }
 
     let reader = {
         let mut reader =
@@ -229,4 +235,35 @@ fn main() {
     let data = reader.lookup(path_hash).unwrap();
     let data = std::str::from_utf8(&data).unwrap();
     println!("{}", data);
+
+    let (chrome_layer, _guard) = ChromeLayerBuilder::new().file("./trace.json").build();
+    tracing_subscriber::registry().with(chrome_layer).init();
+
+    {
+        let mut unpack_dir = root_dir.clone();
+        unpack_dir.push("unpacked_st");
+
+        let start = std::time::Instant::now();
+        reader.unpack(unpack_dir, Some(0), None).unwrap();
+        let duration = std::time::Instant::now().duration_since(start);
+
+        println!(
+            "Unpacked (singlethreaded) in {:.2} sec",
+            duration.as_secs_f32()
+        );
+    }
+
+    {
+        let mut unpack_dir = root_dir.clone();
+        unpack_dir.push("unpacked_mt");
+
+        let start = std::time::Instant::now();
+        reader.unpack(unpack_dir, Some(7), None).unwrap();
+        let duration = std::time::Instant::now().duration_since(start);
+
+        println!(
+            "Unpacked (multithreaded) in {:.2} sec",
+            duration.as_secs_f32()
+        );
+    }
 }

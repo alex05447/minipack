@@ -71,7 +71,6 @@ impl<T> TaskQueue<T> {
         self.condvar.notify_one();
     }
 
-    /*
     /// See `ThreadPool::push_tasks`
     pub(super) fn push_tasks<I: Iterator<Item = T>>(&self, tasks: I) -> usize {
         let mut queue = self.queue.lock().unwrap();
@@ -83,7 +82,6 @@ impl<T> TaskQueue<T> {
         self.condvar.notify_all();
         num_tasks
     }
-    */
 
     /// Called from the worker threads.
     /// Tries to pop a task from the queue, blocking on a condvar if the queue is empty.

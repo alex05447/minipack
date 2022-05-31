@@ -1,13 +1,20 @@
 use {
     crate::*,
+    memmap::*,
+    minifilepath::*,
+    minifiletree::{Reader as FileTreeReader, ReaderError as FileTreeReaderError},
     minilz4::*,
     std::{
         collections::hash_map::{Entry, HashMap},
+        fs::{self, File},
         hash::{BuildHasher, Hasher},
-        num::NonZeroU64,
+        io::Write,
+        num::{NonZeroU64, NonZeroUsize},
         ops::Deref,
         path::PathBuf,
+        thread,
     },
+    tracing::info_span,
 };
 
 /// Result of the successful file data lookup returned by [`PackReader::lookup`] and [`PackReader::lookup_alloc`].
@@ -59,6 +66,7 @@ pub trait Alloc {
 pub struct PackReader {
     index: IndexReader,
     packs: Vec<DataPackReader>,
+    path: PathBuf,
 }
 
 impl PackReader {
@@ -91,17 +99,13 @@ impl PackReader {
         // Read the index file.
         let index = IndexReader::new(&mut path, expected_checksum)?;
 
-        let (lookup_keys, lookup_values) = index.lookup_keys_and_values();
+        //let (lookup_keys, lookup_values) = index.lookup_keys_and_values();
 
         let mut packs: HashMap<PackIndex, DataPackReader> = HashMap::new();
 
         let mut index_checksum = checksum_hasher.build_hasher();
 
-        for (path_hash, index_entry) in lookup_keys
-            .iter()
-            .map(|k| u64_from_bin(*k))
-            .zip(lookup_values.iter().map(PackedIndexEntry::unpack))
-        {
+        for (path_hash, index_entry) in index.path_hashes_and_index_entries() {
             // Get or open the pack file.
             let pack: &DataPackReader = match packs.entry(index_entry.pack_index) {
                 Entry::Occupied(entry) => entry.into_mut(),
@@ -168,7 +172,11 @@ impl PackReader {
             packs_
         };
 
-        Ok(Self { index, packs })
+        Ok(Self { index, packs, path })
+    }
+
+    pub fn checksum(&self) -> Checksum {
+        self.index.checksum()
     }
 
     /// (Optionally) builds the hashmap to accelerate lookups.
@@ -205,16 +213,392 @@ impl PackReader {
         })
     }
 
+    /// Tries to unpack the pack's contents into the folder at `dst_path`.
+    ///
+    /// Requires the pack to be written with support for unpacking (see [`PackOptions::write_file_tree`]).
+    ///
+    /// `num_workers` determines the number of worker threads which will be spawned to decompress and write the source file data.
+    /// If `0`, no worker threads are spawned, all processing is done on the current thread.    ///
+    /// By default, if `None`, the number of worker threads is determined by [`std::thread::available_parallelism`]
+    /// (minus `1` for the current thread, which is also used for compression).
+    ///
+    /// `memory_limit` determines the attempted best-effort limit on the amount of temporary memory
+    /// allocated at any given time for source file decompression purposes if using multiple threads
+    /// (i.e. `num_workers` has a non-zero value, or if `num_workers` is `None`
+    /// but [`std::thread::available_parallelism`] returned a positive value).    ///
+    /// NOTE: the limit will be exceeded if the required amount of memory to decompress a single source file exceeds it in the first place.
+    /// NOTE: this value, if too low, may limit processing parallellism, as worker threads cannot
+    /// proceed while waiting for temporary memory to become available.
+    /// As a rule of thumb, `memory_limit` should be approximately equal to `(num_workers + 1) * average_decompressed_source_file_size`.
+    /// By default, if `None`, temporary memory use is not limited.
+    /// Ignored if not using worker threads.
+    pub fn unpack(
+        &self,
+        dst_path: PathBuf,
+        num_workers: Option<usize>,
+        memory_limit: Option<u64>,
+    ) -> Result<(), UnpackError> {
+        // Open and map the strings file.
+        let map = || -> _ {
+            let mut path = self.path.clone();
+            let path = PathPopGuard::push(&mut path, STRINGS_FILE_NAME);
+            let file = File::open(&path)?;
+            unsafe { Mmap::map(&file) }
+        }()
+        .map_err(UnpackError::FailedToOpenStringsFile)?;
+
+        let file_tree =
+            FileTreeReader::new(&map, Some(self.checksum())).map_err(|err| match err {
+                FileTreeReaderError::InvalidData => UnpackError::InvalidStringsFile,
+                FileTreeReaderError::UnexpectedVersion(version) => {
+                    UnpackError::UnexpectedChecksum(version)
+                }
+            })?;
+
+        // Create the root output directory, if necessary.
+        fs::create_dir_all(&dst_path)
+            .map_err(|err| UnpackError::FailedToCreateOutputFolder((None, err)))?;
+
+        let num_workers = match num_workers {
+            Some(num_workers) => NonZeroUsize::new(num_workers),
+            // Subtract `1` for the main thread.
+            None => thread::available_parallelism()
+                .ok()
+                .and_then(|num_workers| NonZeroUsize::new(num_workers.get() - 1)),
+        };
+
+        if let Some(num_workers) = num_workers {
+            // Allocator we'll use to allocate temp buffers for decompression.
+            let allocator = Allocator::new(memory_limit);
+
+            let context_dst_path = dst_path.clone();
+            let context_absolute_file_path = dst_path.clone();
+
+            let mut thread_pool = ThreadPool::new(
+                num_workers,
+                move |_| WorkerContext {
+                    file_path_builder: FilePathBuilder::new(),
+                    dst_path: context_dst_path,
+                    absolute_file_path: context_absolute_file_path,
+                },
+                |context, task: UnpackTask| -> Option<UnpackResult> {
+                    let file_path_builder =
+                        std::mem::replace(&mut context.file_path_builder, FilePathBuilder::new());
+
+                    let absolute_file_path =
+                        std::mem::replace(&mut context.absolute_file_path, PathBuf::new());
+
+                    let mut reset_paths = |file_path_builder_, mut absolute_file_path_: PathBuf| {
+                        let _ =
+                            std::mem::replace(&mut context.file_path_builder, file_path_builder_);
+                        absolute_file_path_.clear();
+                        absolute_file_path_.push(&context.dst_path);
+                        let _ =
+                            std::mem::replace(&mut context.absolute_file_path, absolute_file_path_);
+                    };
+
+                    match self.process_unpack_task(
+                        &file_tree,
+                        file_path_builder,
+                        absolute_file_path,
+                        &allocator,
+                        task.path_hash,
+                        task.index_entry,
+                    ) {
+                        Ok(res) => match res {
+                            Some((file_path_builder_, absolute_file_path_)) => {
+                                reset_paths(file_path_builder_, absolute_file_path_);
+                                Some(UnpackResult { error: None })
+                            }
+                            None => None,
+                        },
+                        Err((error, file_path_builder_, absolute_file_path_)) => {
+                            reset_paths(file_path_builder_, absolute_file_path_);
+                            Some(UnpackResult { error: Some(error) })
+                        }
+                    }
+                },
+                // Wake up the worker threads blocked on an allocator on error/panic and cancel further allocations.
+                || {
+                    allocator.cancel();
+                },
+            );
+
+            let mut file_path_builder = FilePathBuilder::new();
+            let mut absolute_file_path = dst_path.clone();
+
+            thread_pool.push_tasks(self.index.path_hashes_and_index_entries().map(
+                |(path_hash, index_entry)| UnpackTask {
+                    path_hash,
+                    index_entry,
+                },
+            ));
+
+            thread_pool.finish();
+
+            while let Some(result_or_task) = thread_pool.pop_result_or_task() {
+                match result_or_task {
+                    ResultOrTask::Result(result) => {
+                        if let Some(err) = result.error {
+                            return Err(err);
+                        }
+                    }
+                    ResultOrTask::Task(task) => {
+                        match self
+                            .process_unpack_task(
+                                &file_tree,
+                                file_path_builder,
+                                absolute_file_path,
+                                &allocator,
+                                task.path_hash,
+                                task.index_entry,
+                            )
+                            .map_err(|(err, _, _)| err)?
+                        {
+                            Some((file_path_builder_, mut absolute_file_path_)) => {
+                                file_path_builder = file_path_builder_;
+                                absolute_file_path_.clear();
+                                absolute_file_path_.push(&dst_path);
+                                absolute_file_path = absolute_file_path_;
+                            }
+                            // Must not happen - only ever returns `None` if the main thread `cancel()`'s the allocator, i.e. drops the thread pool,
+                            // and we *are* in the main thread.
+                            None => debug_unreachable("failed to allocate on the main thread"),
+                        }
+                    }
+                }
+            }
+        } else {
+            // Scratch buffer (re)used to decompress compressed file data.
+            let mut uncompressed_buffer = Vec::new();
+
+            let mut file_path_builder = FilePathBuilder::new();
+            let mut absolute_file_path = dst_path.clone();
+
+            for (path_hash, index_entry) in self.index.path_hashes_and_index_entries() {
+                let _span = info_span!("unpack task").entered();
+
+                // Lookup the file path.
+                let file_path = {
+                    let _span = info_span!("lookup file path").entered();
+
+                    file_tree
+                        .lookup_into(path_hash, file_path_builder)
+                        .map_err(|_| UnpackError::InvalidStringsFile)?
+                };
+
+                if let Some(FilePathAndName {
+                    file_path,
+                    file_name,
+                }) = file_path_and_name(&file_path)
+                {
+                    let _span = info_span!("create output folder").entered();
+
+                    // Build the absolute folder path.
+                    absolute_file_path.push(file_path.as_path());
+
+                    // Create the output file directory, if necessary.
+                    fs::create_dir_all(&absolute_file_path).map_err(|err| {
+                        UnpackError::FailedToCreateOutputFolder((Some(file_path.into()), err))
+                    })?;
+
+                    // Build the absolute file path.
+                    absolute_file_path.push(file_name.as_str());
+                } else {
+                    // Build the absolute file path.
+                    absolute_file_path.push(file_path.as_path());
+                }
+
+                // Create the output file.
+                let mut out_file = {
+                    let _span = info_span!("create output file").entered();
+
+                    File::create(&absolute_file_path).map_err(|err| {
+                        UnpackError::FailedToCreateOutputFile((file_path.clone(), err))
+                    })?
+                };
+
+                // Lookup the file data.
+                let data = {
+                    let _span = info_span!("lookup file data").entered();
+
+                    self.lookup_file_data(index_entry)
+                };
+
+                // Decompress the file data if necessary.
+                let data = if let Some(uncompressed_size) = index_entry.is_compressed() {
+                    let _span = info_span!("decompress").entered();
+
+                    decompress_into_vec(data, uncompressed_size, &mut uncompressed_buffer)
+                        .expect("failed to decompress");
+                    &uncompressed_buffer
+                } else {
+                    data
+                };
+
+                // Write the file data to the output file.
+                {
+                    let _span = info_span!("write to output file").entered();
+
+                    out_file.write_all(data).map_err(|err| {
+                        UnpackError::FailedToWriteOutputFile((file_path.clone(), err))
+                    })?;
+                }
+
+                {
+                    let _span = info_span!("close output file").entered();
+
+                    std::mem::drop(out_file);
+                }
+
+                // Reset the relative and absolute paths.
+                file_path_builder = file_path.into_builder();
+                absolute_file_path.clear();
+                absolute_file_path.push(&dst_path);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn process_unpack_task(
+        &self,
+        file_tree: &FileTreeReader<'_>,
+        file_path_builder: FilePathBuilder,
+        mut absolute_file_path: PathBuf,
+        allocator: &Allocator,
+        path_hash: PathHash,
+        index_entry: IndexEntry,
+    ) -> Result<Option<(FilePathBuilder, PathBuf)>, (UnpackError, FilePathBuilder, PathBuf)> {
+        let _span = info_span!("unpack task").entered();
+
+        // Lookup the file path.
+        let file_path = {
+            let _span = info_span!("lookup file path").entered();
+
+            match file_tree.lookup_into(path_hash, file_path_builder) {
+                Ok(file_path) => file_path,
+                Err(file_path_builder) => {
+                    return Err((
+                        UnpackError::InvalidStringsFile,
+                        file_path_builder,
+                        absolute_file_path,
+                    ))
+                }
+            }
+        };
+
+        if let Some(FilePathAndName {
+            file_path: file_path_,
+            file_name,
+        }) = file_path_and_name(&file_path)
+        {
+            let _span = info_span!("create output folder").entered();
+
+            // Build the absolute folder path.
+            absolute_file_path.push(file_path_.as_path());
+
+            // Create the output file directory, if necessary.
+            if let Err(err) = fs::create_dir_all(&absolute_file_path) {
+                return Err((
+                    UnpackError::FailedToCreateOutputFolder((Some(file_path_.into()), err)),
+                    file_path.into_builder(),
+                    absolute_file_path,
+                ));
+            }
+
+            // Build the absolute file path.
+            absolute_file_path.push(file_name.as_str());
+        } else {
+            // Build the absolute file path.
+            absolute_file_path.push(file_path.as_path());
+        }
+
+        // Create the output file.
+        let mut out_file = {
+            let _span = info_span!("create output file").entered();
+
+            match File::create(&absolute_file_path) {
+                Ok(out_file) => out_file,
+                Err(err) => {
+                    return Err((
+                        UnpackError::FailedToCreateOutputFile((file_path.clone(), err)),
+                        file_path.into_builder(),
+                        absolute_file_path,
+                    ));
+                }
+            }
+        };
+
+        // Lookup the file data.
+        let data = {
+            let _span = info_span!("lookup file data").entered();
+
+            self.lookup_file_data(index_entry)
+        };
+
+        if let Some(uncompressed_size) = index_entry.is_compressed() {
+            let mut allocation = match allocator.allocate(uncompressed_size.get()) {
+                Some(allocation) => allocation,
+                None => return Ok(None),
+            };
+
+            // Decompress the file data.
+            {
+                let _span = info_span!("decompress").entered();
+
+                decompress(data, &mut allocation).expect("failed to decompress");
+            }
+
+            // Write the file data to the output file.
+            {
+                let _span = info_span!("write to output file").entered();
+
+                if let Err(err) = out_file.write_all(&allocation) {
+                    return Err((
+                        UnpackError::FailedToWriteOutputFile((file_path.clone(), err)),
+                        file_path.into_builder(),
+                        absolute_file_path,
+                    ));
+                }
+            }
+        } else {
+            {
+                let _span = info_span!("write to output file").entered();
+
+                // Write the file data to the output file.
+                if let Err(err) = out_file.write_all(data) {
+                    return Err((
+                        UnpackError::FailedToWriteOutputFile((file_path.clone(), err)),
+                        file_path.into_builder(),
+                        absolute_file_path,
+                    ));
+                }
+            }
+        }
+
+        {
+            let _span = info_span!("close output file").entered();
+
+            std::mem::drop(out_file);
+        }
+
+        Ok(Some((file_path.into_builder(), absolute_file_path)))
+    }
+
+    fn lookup_file_data(&self, entry: IndexEntry) -> &[u8] {
+        debug_assert!(entry.pack_index < self.packs.len() as _);
+        let pack = unsafe { self.packs.get_unchecked(entry.pack_index as usize) };
+        unsafe { pack.slice(entry.offset, entry.len) }
+    }
+
     fn lookup_impl<O, F: FnOnce(&[u8], NonZeroU64) -> O>(
         &self,
         path_hash: PathHash,
         f: F,
     ) -> Option<LookupResult<'_, O>> {
         if let Some(entry) = self.index.lookup(path_hash) {
-            debug_assert!(entry.pack_index < self.packs.len() as _);
-            let pack = unsafe { self.packs.get_unchecked(entry.pack_index as usize) };
-            let data = unsafe { pack.slice(entry.offset, entry.len) };
-
+            let data = self.lookup_file_data(entry);
             Some(if let Some(uncompressed_len) = entry.is_compressed() {
                 LookupResult::Compressed(f(data, uncompressed_len))
             } else {
@@ -224,4 +608,21 @@ impl PackReader {
             None
         }
     }
+}
+
+struct WorkerContext {
+    file_path_builder: FilePathBuilder,
+    dst_path: PathBuf,
+    absolute_file_path: PathBuf,
+}
+
+unsafe impl Send for WorkerContext {}
+
+struct UnpackTask {
+    path_hash: PathHash,
+    index_entry: IndexEntry,
+}
+
+struct UnpackResult {
+    error: Option<UnpackError>,
 }

@@ -2,7 +2,7 @@ use {
     crate::*,
     std::{
         ops::{Deref, DerefMut},
-        sync::{Arc, Condvar, Mutex},
+        sync::{Condvar, Mutex},
     },
 };
 
@@ -17,7 +17,7 @@ pub(crate) struct Allocation<'a> {
     // Always `Some` as long as the allocation lives, taken only in `Drop` when the allocation is no longer accessible.
     buffer: Option<MemBuffer>,
     // Reference to the allocator, needed to free this allocation on `Drop`.
-    allocator: &'a AllocatorInner,
+    allocator: &'a Allocator,
 }
 
 impl<'a> Allocation<'a> {
@@ -114,23 +114,61 @@ impl AllocatorState {
     }
 }
 
-struct AllocatorInner {
+/// An "allocator" which server these purposes:
+/// - allocate temporary memory for multithreaded source file data compression;
+/// - track such memory use;
+/// - enforce a maximum in-flight memory limit, if any, by blocking allocating threads
+/// if necessary until memory becomes available;
+/// - (TODO) minimize calls to the system allocator by using a preallocated arena.
+///
+/// Created [`Allocation`]'s use RAII to free memory (and thus borrow the [`Allocator`]).
+/// This works fine for our use case.
+pub(crate) struct Allocator {
     allocator: Mutex<AllocatorState>,
     condvar: Condvar,
 }
 
-impl AllocatorInner {
-    fn new(limit: Option<u64>) -> Self {
+impl Allocator {
+    pub(crate) fn new(limit: Option<u64>) -> Self {
         Self {
             allocator: Mutex::new(AllocatorState::new(limit)),
             condvar: Condvar::new(),
         }
     }
 
-    /// Called from the worker threads.
+    /// Called from the worker threads (and also the main thread when unpacking).
+    ///
     /// Tries to allocate `len` bytes respecting the memory limit,
     /// blocking while waiting for free memory if necessary.
-    fn allocate(&self, len: u64) -> Option<MemBuffer> {
+    ///
+    /// Only returns `None` in the worker threads when the main thread has called `cancel()`.
+    pub(crate) fn allocate(&self, len: u64) -> Option<Allocation<'_>> {
+        self.allocate_impl(len).map(|buffer| Allocation {
+            buffer: Some(buffer),
+            allocator: &self,
+        })
+    }
+
+    /// Called from the main thread.
+    ///
+    /// Tries to allocate `len` bytes respecting the memory limit,
+    /// without blocking while waiting for free memory.
+    ///
+    /// Only returns `None` if failed to allocate `len` bytes because of the memory limit.
+    pub(crate) fn try_allocate(&self, len: u64) -> Option<Allocation<'_>> {
+        self.try_allocate_impl(len).map(|buffer| Allocation {
+            buffer: Some(buffer),
+            allocator: &self,
+        })
+    }
+
+    /// Called from the main thread.
+    pub(crate) fn cancel(&self) {
+        self.cancel_impl()
+    }
+
+    /// Called from the worker threads (and also the main thread when unpacking).
+    fn allocate_impl(&self, len: u64) -> Option<MemBuffer> {
         let mut allocator_ = self.allocator.lock().unwrap();
 
         loop {
@@ -152,7 +190,7 @@ impl AllocatorInner {
     /// Called from the main thread.
     /// Tries to allocate `len` bytes respecting the memory limit,
     /// but does not block waiting for free memory on failure.
-    fn try_allocate(&self, len: u64) -> Option<MemBuffer> {
+    fn try_allocate_impl(&self, len: u64) -> Option<MemBuffer> {
         self.allocator.lock().unwrap().allocate(len)
     }
 
@@ -165,59 +203,16 @@ impl AllocatorInner {
     /// Called from the main thread.
     /// Wakes all wating (worker) threads and signals the allocator to fail all following allocations
     /// (e.g. an error occured and we want to return to the caller ASAP).
-    pub(crate) fn cancel(&self) {
+    pub(crate) fn cancel_impl(&self) {
         self.allocator.lock().unwrap().cancel_flag = true;
         self.condvar.notify_all();
     }
 }
 
-impl Drop for AllocatorInner {
+impl Drop for Allocator {
     fn drop(&mut self) {
         let _allocator = self.allocator.lock().unwrap();
         debug_assert_eq!(_allocator.allocated, 0);
-    }
-}
-
-/// An "allocator" which server these purposes:
-/// - allocate temporary memory for multithreaded source file data compression;
-/// - track such memory use;
-/// - enforce a maximum in-flight memory limit, if any, by blocking allocating threads
-/// if necessary until memory becomes available;
-/// - (TODO) minimize calls to the system allocator by using a preallocated arena.
-///
-/// Created [`Allocation`]'s use RAII to free memory (and thus borrow the [`Allocator`]).
-/// This works fine for our use case.
-pub(crate) struct Allocator(Arc<AllocatorInner>);
-
-impl Allocator {
-    pub(crate) fn new(limit: Option<u64>) -> Self {
-        Self(Arc::new(AllocatorInner::new(limit)))
-    }
-
-    /// Called from the worker threads.
-    pub(crate) fn allocate(&self, len: u64) -> Option<Allocation<'_>> {
-        self.0.allocate(len).map(|buffer| Allocation {
-            buffer: Some(buffer),
-            allocator: self.0.as_ref(),
-        })
-    }
-
-    /// Called from the main thread.
-    pub(crate) fn try_allocate(&self, len: u64) -> Option<Allocation<'_>> {
-        self.0.try_allocate(len).map(|buffer| Allocation {
-            buffer: Some(buffer),
-            allocator: self.0.as_ref(),
-        })
-    }
-
-    pub(crate) fn cancel(&self) {
-        self.0.cancel()
-    }
-}
-
-impl Clone for Allocator {
-    fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0))
     }
 }
 

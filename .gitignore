@@ -2,5 +2,9 @@
 .hg/
 .vscode/
 target/
+target_/
+unpacked_st/
+unpacked_mt/
 Cargo.lock
 packed/
+trace.json

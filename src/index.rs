@@ -312,9 +312,21 @@ impl IndexReader {
         unsafe { Self::header(&self.map) }.checksum()
     }
 
-    pub(crate) fn lookup_keys_and_values(&self) -> (&[PathHash], &[PackedIndexEntry]) {
+    fn lookup_keys_and_values(&self) -> (&[PathHash], &[PackedIndexEntry]) {
         // We've made sure the index file is valid.
         unsafe { Self::lookup_keys_and_values_impl(&self.map) }
+    }
+
+    pub(crate) fn path_hashes_and_index_entries(
+        &self,
+    ) -> impl Iterator<Item = (PathHash, IndexEntry)> + '_ {
+        let (lookup_keys, lookup_values) = self.lookup_keys_and_values();
+
+        lookup_keys
+            .iter()
+            .cloned()
+            .map(u64_from_bin)
+            .zip(lookup_values.iter().map(PackedIndexEntry::unpack))
     }
 
     /// (Optionally) builds the hashmap to accelerate lookups.
@@ -331,8 +343,9 @@ impl IndexReader {
             self.lookup.replace(
                 lookup_keys
                     .iter()
-                    .zip(lookup_values.iter())
-                    .map(|(k, v)| (u64_from_bin(*k), v.unpack()))
+                    .cloned()
+                    .map(u64_from_bin)
+                    .zip(lookup_values.iter().map(PackedIndexEntry::unpack))
                     .collect(),
             );
         }

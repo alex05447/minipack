@@ -2,7 +2,7 @@ use {
     crate::*,
     memmap::*,
     minifilepath::*,
-    minifiletree::*,
+    minifiletree::{Writer as FileTreeWriter, WriterError as FileTreeWriterError},
     minilz4::*,
     std::{
         fs::{self, File},
@@ -192,8 +192,7 @@ where
     }
 
     /// `memory_limit` determines the attempted best-effort limit on the amount of temporary memory
-    /// allocated at any given time for source file compression purposes
-    /// if using multiple threads for compression
+    /// allocated at any given time for source file compression purposes if using multiple threads for compression
     /// (i.e. [`PackOptions::num_workers`] was called with a non-zero value, or if [`PackOptions::num_workers`] was not called
     /// but [`std::thread::available_parallelism`] returned a positive value).
     ///
@@ -211,7 +210,7 @@ where
         self
     }
 
-    /// If `write_file_tree` is `true`, data necessary to unpack the file pack is serialized along with it.
+    /// If `write_file_tree` is `true`, data necessary to [`unpack`](PackReader::unpack) the file pack is serialized along with it.
     ///
     /// By default, if this is not called, the file tree is not written.
     pub fn write_file_tree(mut self, write_file_tree: bool) -> Self {
@@ -364,7 +363,7 @@ where
     }
 
     // Create the output directory, if necessary.
-    fs::create_dir_all(&dst_dir).map_err(|err| PackError::FailedToCreateOutputDirectory(err))?;
+    fs::create_dir_all(&dst_dir).map_err(|err| PackError::FailedToCreateOutputFolder(err))?;
 
     let index = IndexWriter::new(checksum_hasher.build_hasher(), &mut dst_dir)?;
     let packs = DataPackWriter::new(max_pack_size);
@@ -635,11 +634,6 @@ where
     // cannot be processed in parallel anyway, so handle them separately on the main thread.
     let mut files_too_large_to_compress_in_parallel = Vec::new();
 
-    // Each worker thread gets its own compressor.
-    struct WorkerContext(Compressor);
-
-    unsafe impl Send for WorkerContext {}
-
     // Allocator we'll use to allocate temp buffers for compression.
     let allocator = Allocator::new(memory_limit);
 
@@ -891,6 +885,11 @@ where
     Ok(())
 }
 
+// Each worker thread gets its own compressor.
+struct WorkerContext(Compressor);
+
+unsafe impl Send for WorkerContext {}
+
 /// A compression task sent to the thread pool from the main thread.
 struct CompressionTask {
     /// Mapped source file data.
@@ -1120,10 +1119,10 @@ where
     F: FnMut(&FilePath, FileSize) -> Result<(), PackError>,
 {
     for entry in fs::read_dir(&absolute_path).map_err(|err| {
-        PackError::FailedToIterateSourceDirectory((relative_path.clone().build(), err))
+        PackError::FailedToIterateSourceFolder((relative_path.clone().build(), err))
     })? {
         let entry = entry.map_err(|err| {
-            PackError::FailedToIterateSourceDirectory((relative_path.clone().build(), err))
+            PackError::FailedToIterateSourceFolder((relative_path.clone().build(), err))
         })?;
         let name = entry.file_name();
 

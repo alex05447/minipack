@@ -12,17 +12,17 @@ use {
 /// An error returned by [`PackOptions::pack`].
 #[derive(Debug)]
 pub enum PackError {
-    /// Failed to iterate files in the source directory.
-    /// Contains the relative path to the directory (or `None` if it is the root source directory)
+    /// Failed to iterate files in the source folder.
+    /// Contains the relative path to the folder (or `None` if it is the root source folder)
     /// and the actual IO error.
-    FailedToIterateSourceDirectory((Option<FilePathBuf>, io::Error)),
+    FailedToIterateSourceFolder((Option<FilePathBuf>, io::Error)),
     /// Encountered an invalid source file name.
     /// Contains the relative path to the invalid source file and the actual error.
     InvalidSourceFileName((PathBuf, FilePathError)),
     /// Failed to open the source file.
     /// Contains the relative path to the source file and the actual IO error.
     ///
-    /// This might happen if the source directory was modified after it was scanned for source files
+    /// This might happen if the source folder was modified after it was scanned for source files
     /// and before the source file was processed.
     FailedToOpenSourceFile((FilePathBuf, io::Error)),
     /// Encountered a file path corresponding to an already processed folder.
@@ -34,9 +34,9 @@ pub enum PackError {
     /// Source file path hash collides with an already processed file path.
     /// Contains the colliding relative paths.
     PathHashCollision((FilePathBuf, FilePathBuf)),
-    /// Failed to create the pack output directory.
+    /// Failed to create the pack output folder.
     /// Contains the actual IO error.
-    FailedToCreateOutputDirectory(io::Error),
+    FailedToCreateOutputFolder(io::Error),
     /// Failed to compress the source file.
     /// Contains the relative path to the source file.
     FailedToCompress(FilePathBuf),
@@ -58,16 +58,16 @@ impl Display for PackError {
         use PackError::*;
 
         match self {
-            FailedToIterateSourceDirectory((dir, err)) => match dir {
-                Some(dir) => write!(f, "failed to iterate the source directory \"{}\": {}", dir, err),
-                None => write!(f, "failed to iterate the root source directory: {}", err),
+            FailedToIterateSourceFolder((dir, err)) => match dir {
+                Some(dir) => write!(f, "failed to iterate the source folder \"{}\": {}", dir, err),
+                None => write!(f, "failed to iterate the root source folder: {}", err),
             },
             InvalidSourceFileName((path, err)) => write!(f, "encountered an invalid source file name: \"{}\", {}", path.display(), err),
             FailedToOpenSourceFile((path, err)) => write!(f, "failed to open the source file \"{}\": {}", path, err),
             FolderAlreadyExistsAtFilePath(path) => write!(f, "encountered a file path corresponding to an already processed file or folder \"{}\"", path),
             FileAlreadyExistsAtFolderPath(path) => write!(f, "encountered a file or folder path corresponding to an already processed file \"{}\"", path),
             PathHashCollision((path0, path1)) => write!(f, "source file path \"{}\" hash collides with an already processed file path \"{}\"", path0, path1),
-            FailedToCreateOutputDirectory(err) => write!(f, "failed to create the pack output directory: {}", err),
+            FailedToCreateOutputFolder(err) => write!(f, "failed to create the pack output folder: {}", err),
             FailedToCompress(path) => write!(f, "failed to compress the source file \"{}\"", path),
             FailedToWriteIndexFile(err) => write!(f, "failed to write to the index file: {}", err),
             FailedToWritePackFile((idx, err)) => write!(f, "failed to write to the data pack file {}: {}", idx, err),

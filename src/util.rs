@@ -8,28 +8,43 @@ use {
 };
 
 pub(crate) fn u16_to_bin_bytes(val: u16) -> [u8; mem::size_of::<u16>()] {
-    u16::to_le_bytes(val)
-    //u16::to_be_bytes(val)
+    if cfg!(feature = "big_endian") {
+        u16::to_be_bytes(val)
+    } else {
+        u16::to_le_bytes(val)
+    }
 }
 
 pub(crate) fn u32_from_bin(bin: u32) -> u32 {
-    u32::from_le(bin)
-    //u32::from_be(bin)
+    if cfg!(feature = "big_endian") {
+        u32::from_be(bin)
+    } else {
+        u32::from_le(bin)
+    }
 }
 
 pub(crate) fn u32_to_bin_bytes(val: u32) -> [u8; mem::size_of::<u32>()] {
-    u32::to_le_bytes(val)
-    //u32::to_be_bytes(val)
+    if cfg!(feature = "big_endian") {
+        u32::to_be_bytes(val)
+    } else {
+        u32::to_le_bytes(val)
+    }
 }
 
 pub(crate) fn u64_from_bin(bin: u64) -> u64 {
-    u64::from_le(bin)
-    //u64::from_be(bin)
+    if cfg!(feature = "big_endian") {
+        u64::from_be(bin)
+    } else {
+        u64::from_le(bin)
+    }
 }
 
 pub(crate) fn u64_to_bin_bytes(val: u64) -> [u8; mem::size_of::<u64>()] {
-    u64::to_le_bytes(val)
-    //u64::to_be_bytes(val)
+    if cfg!(feature = "big_endian") {
+        u64::to_be_bytes(val)
+    } else {
+        u64::to_le_bytes(val)
+    }
 }
 
 fn write_all<W: Write>(w: &mut W, buf: &[u8]) -> Result<usize, io::Error> {
