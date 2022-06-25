@@ -355,7 +355,9 @@ impl PackReader {
                             }
                             // Must not happen - only ever returns `None` if the main thread `cancel()`'s the allocator, i.e. drops the thread pool,
                             // and we *are* in the main thread.
-                            None => unreachable_dbg!("failed to allocate on the main thread"),
+                            None => unsafe {
+                                unreachable_dbg!("failed to allocate on the main thread")
+                            },
                         }
                     }
                 }
