@@ -1,16 +1,16 @@
 use {
     crate::*,
-    memmap::*,
+    memmap2::*,
     minifilepath::*,
     minifiletree::{Writer as FileTreeWriter, WriterError as FileTreeWriterError},
     minilz4::*,
+    miniunchecked::*,
     std::{
         fs::{self, File},
         hash::{BuildHasher, Hasher},
         mem,
         num::{NonZeroU64, NonZeroUsize},
         path::PathBuf,
-        thread,
     },
 };
 
@@ -407,15 +407,9 @@ where
     // and do single- or multi-threaded processing based on the result.
     //
     // Don't need worker threads if we won't be using compression.
-    let num_workers = compression_callback.as_ref().and_then(|_| {
-        match num_workers {
-            Some(num_workers) => NonZeroUsize::new(num_workers),
-            // Subtract `1` for the main thread.
-            None => thread::available_parallelism()
-                .ok()
-                .and_then(|num_workers| NonZeroUsize::new(num_workers.get() - 1)),
-        }
-    });
+    let num_workers = compression_callback
+        .as_ref()
+        .and_then(|_| calc_num_workers(num_workers));
 
     let (mut index_, mut packs) = if let Some(num_workers) = num_workers {
         progress_callbacks.before_packing.map(|before_packing| {
@@ -431,8 +425,7 @@ where
             &file_tree,
             &checksum_hasher,
             unsafe {
-                debug_unwrap_option(
-                    compression_callback,
+                compression_callback.unwrap_unchecked_dbg_msg(
                     "multithreaded packing requires a compression callback",
                 )
             },
@@ -622,7 +615,7 @@ where
             IndexEntry {
                 pack_index: 0,
                 offset: 0,
-                len: 0,
+                size: 0,
                 checksum: 0,
                 uncompressed_len: 0
             }
@@ -637,9 +630,9 @@ where
     // Allocator we'll use to allocate temp buffers for compression.
     let allocator = Allocator::new(memory_limit);
 
-    // Allocates a buffer large enough to hold compressed data for a `len` bytes sized source file.
-    let allocate = |len: FileSize, block: bool| -> Option<Allocation<'_>> {
-        let bound = Compressor::compressed_size_bound(unsafe { NonZeroU64::new_unchecked(len) });
+    // Allocates a buffer large enough to hold compressed data for a `size` bytes sized source file.
+    let allocate = |size: FileSize, block: bool| -> Option<Allocation<'_>> {
+        let bound = Compressor::compressed_size_bound(unsafe { NonZeroU64::new_unchecked(size) });
 
         if block {
             allocator.allocate(bound.get())
@@ -802,10 +795,8 @@ where
     for task in files_too_large_to_compress_in_parallel {
         // Must succeed - only the main thread is allocating and all files are above the memory limit in size.
         let allocation = unsafe {
-            debug_unwrap_option(
-                allocate(task.src_file.len() as _, /* block */ false),
-                "allocation from the main thread must succeed",
-            )
+            allocate(task.src_file.len() as _, /* block */ false)
+                .unwrap_unchecked_dbg_msg("allocation from the main thread must succeed")
         };
 
         compress_file(
@@ -861,7 +852,7 @@ where
     let index_entry = unsafe { index.get_unchecked_mut(insert_index) };
 
     debug_assert_eq!(index_entry.0, 0);
-    debug_assert_eq!(index_entry.1.len, 0);
+    debug_assert_eq!(index_entry.1.size, 0);
     *index_entry = (
         path_hash,
         IndexEntry::new_uncompressed(
@@ -916,10 +907,9 @@ struct CompressedBuffer<'a> {
 impl<'a> CompressedBuffer<'a> {
     /// Returns the subslice of the allocation with the compressed source file data.
     fn compressed(&self) -> &[u8] {
-        debug_assert!(self.compressed_size.get() <= self.allocation.len() as FileSize);
         unsafe {
             self.allocation
-                .get_unchecked(0..self.compressed_size.get() as usize)
+                .get_unchecked_dbg(0..self.compressed_size.get() as usize)
         }
     }
 }
@@ -942,10 +932,9 @@ where
     H::Hasher: Clone,
 {
     unsafe {
-        debug_unwrap_result(
-            file_tree.lookup_into(path_hash, builder),
-            "failed to look up an inserted path",
-        )
+        file_tree
+            .lookup_into(path_hash, builder)
+            .unwrap_unchecked_dbg_msg("failed to look up an inserted path")
     }
 }
 
@@ -980,11 +969,10 @@ where
     let (compressed, file_data) = if compressed_size.get() >= task.src_file.len() as _ {
         (false, task.src_file.as_ref())
     } else {
-        debug_assert!(compressed_size.get() <= allocation.len() as _);
         (true, unsafe {
             allocation
                 .as_ref()
-                .get_unchecked(0..compressed_size.get() as usize)
+                .get_unchecked_dbg(0..compressed_size.get() as usize)
         })
     };
 
@@ -999,7 +987,7 @@ where
     let index_entry = unsafe { index.get_unchecked_mut(task.insert_index) };
 
     debug_assert_eq!(index_entry.0, 0);
-    debug_assert_eq!(index_entry.1.len, 0);
+    debug_assert_eq!(index_entry.1.size, 0);
     *index_entry = (
         task.path_hash,
         if compressed {
@@ -1057,7 +1045,7 @@ where
         let index_entry = unsafe { index.get_unchecked_mut(result.task.insert_index) };
 
         debug_assert_eq!(index_entry.0, 0);
-        debug_assert_eq!(index_entry.1.len, 0);
+        debug_assert_eq!(index_entry.1.size, 0);
         *index_entry = (
             result.task.path_hash,
             IndexEntry::new_compressed(
@@ -1142,7 +1130,10 @@ where
             PackError::FailedToOpenSourceFile((
                 // Must succeed - path is not empty.
                 unsafe {
-                    debug_unwrap_option(relative_path.clone().build(), "path must not be empty")
+                    relative_path
+                        .clone()
+                        .build()
+                        .unwrap_unchecked_dbg_msg("path must not be empty")
                 },
                 err,
             ))
@@ -1154,7 +1145,9 @@ where
                 relative_path = {
                     // Must succeed - path is not empty.
                     let relative_path = unsafe {
-                        debug_unwrap_option(relative_path.build(), "path must not be empty")
+                        relative_path
+                            .build()
+                            .unwrap_unchecked_dbg_msg("path must not be empty")
                     };
                     f(&relative_path, metadata.len())?;
                     relative_path.into_builder()

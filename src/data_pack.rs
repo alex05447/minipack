@@ -1,6 +1,7 @@
 use {
     crate::*,
-    memmap::*,
+    memmap2::*,
+    miniunchecked::*,
     std::{
         collections::hash_map::HashMap,
         fs::{File, OpenOptions},
@@ -153,13 +154,12 @@ impl DataPack {
         self.file.flush()
     }
 
-    /// User guarantees the `offset` and `len` are valid for this data pack file.
-    fn read(data: &[u8], mut offset: Offset, len: FileSize) -> &[u8] {
+    /// User guarantees the `offset` and `size` are valid for this data pack file.
+    fn read(data: &[u8], mut offset: Offset, size: FileSize) -> &[u8] {
         let header_size = mem::size_of::<DataPackHeader>() as Offset;
         // Offset is relative to the data pack's payload (after the header), so need to offset by header size.
         offset += header_size;
-        debug_assert!(offset + len <= data.len() as _);
-        unsafe { data.get_unchecked(offset as usize..(offset + len) as usize) }
+        unsafe { data.get_unchecked_dbg(offset as usize..(offset + size) as usize) }
     }
 
     /// Compacts the data pack file.
@@ -204,7 +204,9 @@ impl DataPack {
         for (path_hash, pack_file) in pack_files.iter_mut() {
             // ... determine the pack index this file should be in.
             let dst_pack_index = *unsafe {
-                debug_unwrap_option(pack_index_lookup.get(path_hash), "invalid path hash")
+                pack_index_lookup
+                    .get(path_hash)
+                    .unwrap_unchecked_dbg_msg("invalid path hash")
             };
 
             // If the file should be in a different pack ...
@@ -213,7 +215,7 @@ impl DataPack {
                 let dst_pack = packs.get(dst_pack_index);
 
                 let new_offset = dst_pack
-                    .write(Self::read(&pack_data, pack_file.offset, pack_file.len))
+                    .write(Self::read(&pack_data, pack_file.offset, pack_file.size))
                     .map_err(|err| PackError::FailedToWritePackFile((dst_pack_index as _, err)))?;
 
                 // Patch the entry for the moved file with the new pack index and offset within it.
@@ -267,7 +269,7 @@ impl DataPack {
         for (pack_file, new_offset_) in pack_files.iter_mut().filter_map(|(_, pack_file)| {
             if pack_file.pack_index == pack_index {
                 let offset = new_offset;
-                new_offset += pack_file.len;
+                new_offset += pack_file.size;
                 (pack_file.offset != offset).then(|| {
                     // Source files only move upwards when defragmenting.
                     debug_assert!(pack_file.offset > offset);
@@ -280,12 +282,12 @@ impl DataPack {
             debug_assert!(new_offset_ <= pack_file.offset);
 
             // ... copy the file's data from its current location in the data pack file to the new offset.
-            let src = Self::read(&pack_data, pack_file.offset, pack_file.len).as_ptr();
+            let src = Self::read(&pack_data, pack_file.offset, pack_file.size).as_ptr();
             // Must account for the header size as offsets are relative to the data pack file's payload (past the header).
             let dst = unsafe { data.offset(header_size as isize + new_offset_ as isize) };
 
             // May overlap.
-            unsafe { std::ptr::copy(src, dst, pack_file.len as _) };
+            unsafe { std::ptr::copy(src, dst, pack_file.size as _) };
 
             // Patch the entry for the moved file with the new offset within the curent data pack file.
             // Length/checksum are of course unchanged.
@@ -538,7 +540,7 @@ impl DataPackWriter {
 
             index
                 .iter()
-                .map(|(hash, index_entry)| (*hash, virtual_packs.reserve(index_entry.len)))
+                .map(|(hash, index_entry)| (*hash, virtual_packs.reserve(index_entry.size)))
                 .collect::<HashMap<_, _>>()
         };
 
@@ -694,15 +696,17 @@ impl DataPackReader {
     /// All byte offsets in the index file are relative to this.
     pub(crate) fn data(&self) -> &[u8] {
         // The caller guarantees the data is at least large enough for a `PackHeader` and a single byte of payload.
-        unsafe { self.map.get_unchecked(mem::size_of::<DataPackHeader>()..) }
+        unsafe {
+            self.map
+                .get_unchecked_dbg(mem::size_of::<DataPackHeader>()..)
+        }
     }
 
-    /// Returns a subslice within the data pack's payload `data()` blob at `offset` (in bytes) from the start, with `len` byte elements.
-    /// The caller guarantees `offset` and `len` are valid.
-    pub(crate) unsafe fn slice(&self, offset: Offset, len: FileSize) -> &[u8] {
+    /// Returns a subslice within the data pack's payload `data()` blob at `offset` (in bytes) from the start, with `size` byte elements.
+    /// The caller guarantees `offset` and `size` are valid.
+    pub(crate) unsafe fn slice(&self, offset: Offset, size: FileSize) -> &[u8] {
         let data = self.data();
-        debug_assert!(offset + len <= data.len() as _);
-        data.get_unchecked(offset as usize..(offset + len) as usize)
+        data.get_unchecked_dbg(offset as usize..(offset + size) as usize)
     }
 
     /// The caller guarantees `data` is at least large enough for a `PackHeader`.

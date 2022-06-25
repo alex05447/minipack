@@ -3,6 +3,7 @@ use {
     std::{
         io::{self, Write},
         mem::{self, ManuallyDrop},
+        num::NonZeroUsize,
         path::{Path, PathBuf},
     },
 };
@@ -57,30 +58,6 @@ pub(crate) fn write_u64<W: Write>(w: &mut W, val: u64) -> Result<usize, io::Erro
 
 pub(crate) fn write_u32<W: Write>(w: &mut W, val: u32) -> Result<usize, io::Error> {
     write_all(w, &u32_to_bin_bytes(val))
-}
-
-pub(crate) fn debug_unreachable(msg: &'static str) -> ! {
-    if cfg!(debug_assertions) {
-        unreachable!("{}", msg)
-    } else {
-        unsafe { std::hint::unreachable_unchecked() }
-    }
-}
-
-pub(crate) unsafe fn debug_unwrap_result<T, E>(val: Result<T, E>, msg: &'static str) -> T {
-    if let Ok(val) = val {
-        val
-    } else {
-        debug_unreachable(msg)
-    }
-}
-
-pub(crate) unsafe fn debug_unwrap_option<T>(val: Option<T>, msg: &'static str) -> T {
-    if let Some(val) = val {
-        val
-    } else {
-        debug_unreachable(msg)
-    }
 }
 
 /// The pack's checksum/"version" is calculated by consecutively hashing tuples of
@@ -159,4 +136,16 @@ pub(crate) unsafe fn empty_vec_into_allocation<T>(mut vec: Vec<T>) -> VecAllocat
 /// Caller guarantees `parts` where created by a previous call to `empty_vec_into_raw_parts()` for a empty vector of matching element type `T`.
 pub(crate) fn empty_vec_from_allocation<T>(parts: VecAllocation) -> Vec<T> {
     unsafe { Vec::from_raw_parts(parts.allocation as *mut T, 0, parts.capacity) }
+}
+
+const MAX_NUM_WORKERS: usize = 63;
+
+pub(crate) fn calc_num_workers(num_workers: Option<usize>) -> Option<NonZeroUsize> {
+    match num_workers {
+        Some(num_workers) => NonZeroUsize::new(num_workers.min(MAX_NUM_WORKERS)),
+        // Subtract `1` for the main thread.
+        None => std::thread::available_parallelism()
+            .ok()
+            .and_then(|num_workers| NonZeroUsize::new(num_workers.get() - 1)),
+    }
 }

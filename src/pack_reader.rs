@@ -1,18 +1,18 @@
 use {
     crate::*,
-    memmap::*,
+    memmap2::*,
     minifilepath::*,
     minifiletree::{Reader as FileTreeReader, ReaderError as FileTreeReaderError},
     minilz4::*,
+    miniunchecked::*,
     std::{
         collections::hash_map::{Entry, HashMap},
         fs::{self, File},
         hash::{BuildHasher, Hasher},
         io::Write,
-        num::{NonZeroU64, NonZeroUsize},
+        num::NonZeroU64,
         ops::Deref,
         path::PathBuf,
-        thread,
     },
     tracing::info_span,
 };
@@ -52,14 +52,14 @@ impl<'b, O: AsRef<[u8]>> Deref for LookupResult<'b, O> {
 /// Trait representing an allocator interface used by [`PackReader::lookup_alloc`]
 /// to allocate backing memory for decompressed resource files.
 pub trait Alloc {
-    /// Allocates `len` bytes and returns a mutable reference to the allocated byte slice
+    /// Allocates `size` bytes and returns a mutable reference to the allocated byte slice
     /// to be filled with the decompressed resource file's data.
     ///
-    /// Implementation guarantees the length of the returned byte slice is exactly `len`.
+    /// Implementation guarantees the length of the returned byte slice is exactly `size`.
     ///
     /// TODO: alignment.
     /// TODO: out of memory handling.
-    fn alloc(&self, len: NonZeroU64) -> &mut [u8];
+    fn alloc(&self, size: NonZeroU64) -> &mut [u8];
 }
 
 /// Provides an interface to lookup resource file data from the resource pack.
@@ -117,19 +117,19 @@ impl PackReader {
             };
 
             // Do the bounds checks on the index entrie's offset and length.
-            if (index_entry.offset + index_entry.len) > pack.data().len() as _ {
+            if (index_entry.offset + index_entry.size) > pack.data().len() as _ {
                 return Err(PackReaderError::CorruptData);
             }
 
             // Make sure the uncompressed length is valid.
-            if index_entry.uncompressed_len <= index_entry.len && index_entry.uncompressed_len != 0
+            if index_entry.uncompressed_len <= index_entry.size && index_entry.uncompressed_len != 0
             {
                 return Err(PackReaderError::CorruptData);
             }
 
             // If required, validate the file data checksum.
             if validate_checksum {
-                let file_data = unsafe { pack.slice(index_entry.offset, index_entry.len) };
+                let file_data = unsafe { pack.slice(index_entry.offset, index_entry.size) };
                 let file_checksum = {
                     let mut file_hasher = checksum_hasher.build_hasher();
                     file_hasher.write(file_data);
@@ -147,7 +147,7 @@ impl PackReader {
                 path_hash,
                 index_entry.pack_index,
                 index_entry.checksum,
-                index_entry.len,
+                index_entry.size,
             );
         }
 
@@ -259,15 +259,7 @@ impl PackReader {
         fs::create_dir_all(&dst_path)
             .map_err(|err| UnpackError::FailedToCreateOutputFolder((None, err)))?;
 
-        let num_workers = match num_workers {
-            Some(num_workers) => NonZeroUsize::new(num_workers),
-            // Subtract `1` for the main thread.
-            None => thread::available_parallelism()
-                .ok()
-                .and_then(|num_workers| NonZeroUsize::new(num_workers.get() - 1)),
-        };
-
-        if let Some(num_workers) = num_workers {
+        if let Some(num_workers) = calc_num_workers(num_workers) {
             // Allocator we'll use to allocate temp buffers for decompression.
             let allocator = Allocator::new(memory_limit);
 
@@ -363,7 +355,7 @@ impl PackReader {
                             }
                             // Must not happen - only ever returns `None` if the main thread `cancel()`'s the allocator, i.e. drops the thread pool,
                             // and we *are* in the main thread.
-                            None => debug_unreachable("failed to allocate on the main thread"),
+                            None => unreachable_dbg!("failed to allocate on the main thread"),
                         }
                     }
                 }
@@ -587,9 +579,8 @@ impl PackReader {
     }
 
     fn lookup_file_data(&self, entry: IndexEntry) -> &[u8] {
-        debug_assert!(entry.pack_index < self.packs.len() as _);
-        let pack = unsafe { self.packs.get_unchecked(entry.pack_index as usize) };
-        unsafe { pack.slice(entry.offset, entry.len) }
+        let pack = unsafe { self.packs.get_unchecked_dbg(entry.pack_index as usize) };
+        unsafe { pack.slice(entry.offset, entry.size) }
     }
 
     fn lookup_impl<O, F: FnOnce(&[u8], NonZeroU64) -> O>(

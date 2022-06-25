@@ -1,5 +1,5 @@
 use {
-    crate::*,
+    miniunchecked::*,
     std::{
         ops::{Deref, DerefMut},
         sync::{Condvar, Mutex},
@@ -22,15 +22,29 @@ pub(crate) struct Allocation<'a> {
 
 impl<'a> Allocation<'a> {
     fn as_ref(&self) -> &[u8] {
-        unsafe { debug_unwrap_option(self.buffer.as_ref(), "invalid allocation state") }.as_ref()
+        unsafe {
+            self.buffer
+                .as_ref()
+                .unwrap_unchecked_dbg_msg("invalid allocation state")
+        }
+        .as_ref()
     }
 
     fn as_mut(&mut self) -> &mut [u8] {
-        unsafe { debug_unwrap_option(self.buffer.as_mut(), "invalid allocation state") }.as_mut()
+        unsafe {
+            self.buffer
+                .as_mut()
+                .unwrap_unchecked_dbg_msg("invalid allocation state")
+        }
+        .as_mut()
     }
 
     fn take_buffer(&mut self) -> MemBuffer {
-        unsafe { debug_unwrap_option(self.buffer.take(), "invalid allocation state") }
+        unsafe {
+            self.buffer
+                .take()
+                .unwrap_unchecked_dbg_msg("invalid allocation state")
+        }
     }
 }
 
@@ -138,12 +152,12 @@ impl Allocator {
 
     /// Called from the worker threads (and also the main thread when unpacking).
     ///
-    /// Tries to allocate `len` bytes respecting the memory limit,
+    /// Tries to allocate `size` bytes respecting the memory limit,
     /// blocking while waiting for free memory if necessary.
     ///
     /// Only returns `None` in the worker threads when the main thread has called `cancel()`.
-    pub(crate) fn allocate(&self, len: u64) -> Option<Allocation<'_>> {
-        self.allocate_impl(len).map(|buffer| Allocation {
+    pub(crate) fn allocate(&self, size: u64) -> Option<Allocation<'_>> {
+        self.allocate_impl(size).map(|buffer| Allocation {
             buffer: Some(buffer),
             allocator: &self,
         })
@@ -151,12 +165,12 @@ impl Allocator {
 
     /// Called from the main thread.
     ///
-    /// Tries to allocate `len` bytes respecting the memory limit,
+    /// Tries to allocate `size` bytes respecting the memory limit,
     /// without blocking while waiting for free memory.
     ///
-    /// Only returns `None` if failed to allocate `len` bytes because of the memory limit.
-    pub(crate) fn try_allocate(&self, len: u64) -> Option<Allocation<'_>> {
-        self.try_allocate_impl(len).map(|buffer| Allocation {
+    /// Only returns `None` if failed to allocate `size` bytes because of the memory limit.
+    pub(crate) fn try_allocate(&self, size: u64) -> Option<Allocation<'_>> {
+        self.try_allocate_impl(size).map(|buffer| Allocation {
             buffer: Some(buffer),
             allocator: &self,
         })
@@ -188,10 +202,10 @@ impl Allocator {
     }
 
     /// Called from the main thread.
-    /// Tries to allocate `len` bytes respecting the memory limit,
+    /// Tries to allocate `size` bytes respecting the memory limit,
     /// but does not block waiting for free memory on failure.
-    fn try_allocate_impl(&self, len: u64) -> Option<MemBuffer> {
-        self.allocator.lock().unwrap().allocate(len)
+    fn try_allocate_impl(&self, size: u64) -> Option<MemBuffer> {
+        self.allocator.lock().unwrap().allocate(size)
     }
 
     /// Called from any thread.

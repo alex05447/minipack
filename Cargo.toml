@@ -14,11 +14,12 @@ big_endian = ["minifiletree/big_endian"]
 [dependencies]
 static_assertions = "1.1.*"
 seahash = "4.1"
-memmap = "0.7.*"
+memmap2 = "0.5.*"
 minifiletree = { path = "../minifiletree" }
 minifilepath = { path = "../minifilepath" }
 minilz4 = { path = "../minilz4" }
 miniclosure = { path = "../miniclosure" }
+miniunchecked = { path = "../miniunchecked" }
 tracing = "0.1.*"
 
 [dev-dependencies]

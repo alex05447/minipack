@@ -1,14 +1,13 @@
-use std::io::Seek;
-
 use {
     crate::*,
-    memmap::*,
+    memmap2::*,
+    miniunchecked::*,
     static_assertions::*,
     std::{
         collections::HashMap,
         fs::File,
         hash::Hasher,
-        io::{self, SeekFrom, Write},
+        io::{self, Seek, SeekFrom, Write},
         iter::Iterator,
         mem,
         num::NonZeroU64,
@@ -74,8 +73,8 @@ impl IndexHeader {
 #[repr(C, packed)]
 pub(crate) struct PackedIndexEntry {
     /// Index of the data pack the file is in (top two bytes),
-    /// and length in bytes of the file's data within the containing data pack (bottom six bytes).
-    pack_index_and_len: PackIndexAndLen,
+    /// and size in bytes of the file's data within the containing data pack (bottom six bytes).
+    pack_index_and_size: PackIndexAndSize,
     /// Offset in bytes to the start of the file's data within the containing data pack (starting past the data pack's header).
     offset: Offset,
     /// Checksum / hash of the file's data (as stored in the data pack, i.e. optionally compressed).
@@ -88,7 +87,7 @@ pub(crate) struct PackedIndexEntry {
 
 impl PackedIndexEntry {
     pub(crate) fn unpack(&self) -> IndexEntry {
-        let (pack_index, len) = unpack_pack_index_and_len(u64_from_bin(self.pack_index_and_len));
+        let (pack_index, size) = unpack_pack_index_and_size(u64_from_bin(self.pack_index_and_size));
 
         let uncompressed_len = u64_from_bin(self.uncompressed_len);
 
@@ -96,15 +95,15 @@ impl PackedIndexEntry {
             IndexEntry::new_uncompressed(
                 pack_index,
                 u64_from_bin(self.offset),
-                len,
+                size,
                 u64_from_bin(self.checksum),
             )
         } else {
-            debug_assert!(uncompressed_len > len);
+            debug_assert!(uncompressed_len > size);
             IndexEntry::new_compressed(
                 pack_index,
                 u64_from_bin(self.offset),
-                len,
+                size,
                 u64_from_bin(self.checksum),
                 uncompressed_len,
             )
@@ -113,40 +112,40 @@ impl PackedIndexEntry {
 }
 
 /// Two highest bytes: pack index, lower bytes: data length in bytes.
-type PackIndexAndLen = u64;
+type PackIndexAndSize = u64;
 
-const LEN_BITS: PackIndexAndLen = 48;
-const LEN_OFFSET: PackIndexAndLen = 0;
-const MAX_LEN: PackIndexAndLen = (1 << LEN_BITS) - 1;
-const LEN_MASK: PackIndexAndLen = MAX_LEN << LEN_OFFSET;
+const LEN_BITS: PackIndexAndSize = 48;
+const SIZE_OFFSET: PackIndexAndSize = 0;
+const MAX_FILE_SIZE: PackIndexAndSize = (1 << LEN_BITS) - 1;
+const SIZE_MASK: PackIndexAndSize = MAX_FILE_SIZE << SIZE_OFFSET;
 
-const PACK_INDEX_BITS: PackIndexAndLen = 16;
-const PACK_INDEX_OFFSET: PackIndexAndLen = LEN_BITS;
-const MAX_PACK_INDEX: PackIndexAndLen = (1 << PACK_INDEX_BITS) - 1;
-const PACK_INDEX_MASK: PackIndexAndLen = MAX_PACK_INDEX << PACK_INDEX_OFFSET;
+const PACK_INDEX_BITS: PackIndexAndSize = 16;
+const PACK_INDEX_OFFSET: PackIndexAndSize = LEN_BITS;
+const MAX_PACK_INDEX: PackIndexAndSize = (1 << PACK_INDEX_BITS) - 1;
+const PACK_INDEX_MASK: PackIndexAndSize = MAX_PACK_INDEX << PACK_INDEX_OFFSET;
 
 const_assert!(
-    PACK_INDEX_BITS + LEN_BITS == (mem::size_of::<PackIndexAndLen>() as PackIndexAndLen) * 8
+    PACK_INDEX_BITS + LEN_BITS == (mem::size_of::<PackIndexAndSize>() as PackIndexAndSize) * 8
 );
 
-// See `pack_pack_index_and_len`.
-fn unpack_pack_index_and_len(pack_index_and_len: PackIndexAndLen) -> (PackIndex, FileSize) {
+// See `pack_pack_index_and_size`.
+fn unpack_pack_index_and_size(pack_index_and_size: PackIndexAndSize) -> (PackIndex, FileSize) {
     (
-        ((pack_index_and_len & PACK_INDEX_MASK) >> PACK_INDEX_OFFSET) as PackIndex,
-        ((pack_index_and_len & LEN_MASK) >> LEN_OFFSET) as FileSize,
+        ((pack_index_and_size & PACK_INDEX_MASK) >> PACK_INDEX_OFFSET) as PackIndex,
+        ((pack_index_and_size & SIZE_MASK) >> SIZE_OFFSET) as FileSize,
     )
 }
 
-// See `unpack_pack_index_and_len`.
-fn pack_pack_index_and_len(pack_index: PackIndex, len: FileSize) -> PackIndexAndLen {
-    debug_assert!(len > 0);
-    // Maximum `len` value we can encode is 48 bits, or 256 terabytes, which is more than enough.
-    debug_assert!(len <= MAX_LEN);
+// See `unpack_pack_index_and_size`.
+fn pack_pack_index_and_size(pack_index: PackIndex, size: FileSize) -> PackIndexAndSize {
+    debug_assert!(size > 0);
+    // Maximum file size we can encode is 48 bits, or 256 terabytes, which is more than enough.
+    debug_assert!(size <= MAX_FILE_SIZE);
     // Maximum `pack_index` value we can encode is 16 bits, or 64k packs, which is more than enough.
-    debug_assert!((pack_index as PackIndexAndLen) <= MAX_PACK_INDEX);
+    debug_assert!((pack_index as PackIndexAndSize) <= MAX_PACK_INDEX);
 
-    (((pack_index as PackIndexAndLen) << PACK_INDEX_OFFSET) & PACK_INDEX_MASK)
-        | (((len as PackIndexAndLen) << LEN_OFFSET) & LEN_MASK)
+    (((pack_index as PackIndexAndSize) << PACK_INDEX_OFFSET) & PACK_INDEX_MASK)
+        | (((size as PackIndexAndSize) << SIZE_OFFSET) & SIZE_MASK)
 }
 
 /// See `PackedIndexEntry`.
@@ -154,7 +153,7 @@ fn pack_pack_index_and_len(pack_index: PackIndex, len: FileSize) -> PackIndexAnd
 pub(crate) struct IndexEntry {
     pub(crate) pack_index: PackIndex,
     pub(crate) offset: Offset,
-    pub(crate) len: FileSize,
+    pub(crate) size: FileSize,
     pub(crate) checksum: Checksum,
     pub(crate) uncompressed_len: FileSize,
 }
@@ -163,15 +162,15 @@ impl IndexEntry {
     pub(crate) fn new_compressed(
         pack_index: PackIndex,
         offset: Offset,
-        len: FileSize,
+        size: FileSize,
         checksum: Checksum,
         uncompressed_len: FileSize,
     ) -> Self {
-        debug_assert!(uncompressed_len > len);
+        debug_assert!(uncompressed_len > size);
         Self {
             pack_index,
             offset,
-            len,
+            size,
             checksum,
             uncompressed_len,
         }
@@ -180,13 +179,13 @@ impl IndexEntry {
     pub(crate) fn new_uncompressed(
         pack_index: PackIndex,
         offset: Offset,
-        len: FileSize,
+        size: FileSize,
         checksum: Checksum,
     ) -> Self {
         Self {
             pack_index,
             offset,
-            len,
+            size,
             checksum,
             uncompressed_len: 0,
         }
@@ -195,7 +194,7 @@ impl IndexEntry {
     pub(crate) fn write<W: Write>(&self, w: &mut W) -> Result<usize, std::io::Error> {
         let mut written = 0;
 
-        written += write_u64(w, pack_pack_index_and_len(self.pack_index, self.len))?;
+        written += write_u64(w, pack_pack_index_and_size(self.pack_index, self.size))?;
         written += write_u64(w, self.offset)?;
         written += write_u64(w, self.checksum)?;
         written += write_u64(w, self.uncompressed_len)?;
@@ -208,7 +207,7 @@ impl IndexEntry {
     /// Returns the uncompressed size in bytes of the source file
     /// represented by this index entry if it is compressed; otherwise returns `None`.
     pub(crate) fn is_compressed(&self) -> Option<NonZeroU64> {
-        debug_assert!(self.uncompressed_len == 0 || (self.uncompressed_len > self.len));
+        debug_assert!(self.uncompressed_len == 0 || (self.uncompressed_len > self.size));
         NonZeroU64::new(self.uncompressed_len)
     }
 }
@@ -254,7 +253,7 @@ impl<H: Hasher> IndexWriter<H> {
                     path_hash,
                     entry.pack_index,
                     entry.checksum,
-                    entry.len,
+                    entry.size,
                 );
 
                 entry.write(&mut self.file)?;
@@ -360,8 +359,7 @@ impl IndexReader {
             // NOTE - binary search relies on path hash sorting when packing.
             if let Ok(idx) = lookup_keys.binary_search_by(|&key| u64_from_bin(key).cmp(&path_hash))
             {
-                debug_assert!(idx < lookup_values.len());
-                Some(unsafe { lookup_values.get_unchecked(idx) }.unpack())
+                Some(unsafe { lookup_values.get_unchecked_dbg(idx) }.unpack())
             } else {
                 None
             }
@@ -415,13 +413,13 @@ impl IndexReader {
     }
 
     /// Calculates the length of the index lookup in elements (i.e. pairs of (path hash, index entry)).
-    /// The caller guarantees `data_len` contains an integer number of lookup elements.
-    fn len(data_len: FileSize) -> u64 {
+    /// The caller guarantees `data_size` contains an integer number of lookup elements.
+    fn len(data_size: FileSize) -> FileSize {
         let header_size = mem::size_of::<IndexHeader>() as FileSize;
         let lookup_pair_size =
             (mem::size_of::<PathHash>() + mem::size_of::<PackedIndexEntry>()) as FileSize;
-        debug_assert!(data_len > header_size);
-        let payload_size = data_len - header_size;
+        debug_assert!(data_size > header_size);
+        let payload_size = data_size - header_size;
         payload_size / lookup_pair_size
     }
 
